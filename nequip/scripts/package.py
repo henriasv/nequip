@@ -139,6 +139,16 @@ def main(args=None):
                         default_flow_style=False,
                     )
                 )
+                if "head_names" in pkg_metadata:
+                    print("Multi-Head Model")
+                    print("================")
+                    print(f"Available heads: {pkg_metadata['head_names']}")
+                    print(
+                        "Use `nequip-compile <pkg> <out> --mode ... --device ... --head <name>` "
+                        "to compile a specific head."
+                    )
+                    print()
+
                 if modifiers_info is not None:
                     print("Available Modifiers")
                     print("===================")
@@ -278,6 +288,15 @@ def main(args=None):
                     "available_models": list(models_to_package.keys()),
                     "atom_types": {idx: name for idx, name in enumerate(type_names)},
                 }
+
+                # Detect multi-head model and store head names
+                from nequip.utils import find_first_of_type
+                from nequip.nn import MultiHeadReadout
+
+                sample_model = list(eager_model.values())[0]
+                _mhr = find_first_of_type(sample_model, MultiHeadReadout)
+                if _mhr is not None:
+                    pkg_metadata["head_names"] = _mhr.head_names
                 pkg_metadata = yaml.dump(
                     pkg_metadata,
                     default_flow_style=False,

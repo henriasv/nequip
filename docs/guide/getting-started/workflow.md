@@ -103,6 +103,8 @@ The output path MUST have the extension `.nequip.zip`.
 To see command line options, one can use `nequip-package -h`. There are two options `build` and `info`, so one can get more detailed information with `nequip-package build -h` and `nequip-package info -h`.
 ```
 
+For [multi-head models](../training-techniques/multitask_training.md#multi-head-training), `nequip-package` preserves all heads. Use `nequip-package info` to see available head names.
+
 While checkpoint files are unlikely to survive breaking changes across updates to the software, the packaging infrastructure is designed to allow packaged models to remain usable as the framework is updated.
 `nequip-package` saves not only the model and its weights, but also a snapshot of the code that implements the model at the time the model is packaged.
 The packaged model can thus be loaded and used independently even if new and different versions of NequIP (and extensions such as {mod}`allegro`) are later installed.
@@ -147,6 +149,12 @@ AOTInductor requires access to compilers like `gcc` and `nvcc` when running `neq
 If `--mode aotinductor` is used, the compiled model will be specific to a specified `--target` integration. For example, the framework provides `--target ase` for compiled models to be used with ASE, `--target pair_nequip` for compiled NequIP GNN models to be used in LAMMPS, or `--target pair_allegro` for compiled Allegro models to be used in LAMMPS.
 
 The `--target` flag wraps the `--input-fields` and `--output-fields` options. Developers designing new models or wanting to set up new integrations can manually provide `--input-fields` and `--output-fields`. New integration "target"s may be added through PRs or through NequIP extension packages. Engage with us on GitHub if you seek to do something like this.
+```
+
+For [multi-head models](../training-techniques/multitask_training.md#multi-head-training), use the `--head` flag to select which head to compile:
+```bash
+nequip-compile model.nequip.zip compiled.nequip.pth \
+  --mode torchscript --device cuda --head dft
 ```
 
 ```{tip}

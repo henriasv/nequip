@@ -19,6 +19,7 @@ _DEFAULT_LONG_FIELDS: Set[str] = {
     _keys.NUM_LOCAL_GHOST_NODES_KEY,
     _keys.TOTAL_CHARGE_KEY,
     _keys.TOTAL_SPIN_KEY,
+    _keys.HEAD_KEY,
 }
 _DEFAULT_GRAPH_FIELDS: Set[str] = {
     _keys.TOTAL_ENERGY_KEY,
@@ -33,6 +34,8 @@ _DEFAULT_GRAPH_FIELDS: Set[str] = {
     _keys.TOTAL_MAGMOM_KEY,
     _keys.POLARIZATION_KEY,
     _keys.DIELECTRIC_KEY,
+    _keys.FRAME_SUBSET_KEY,
+    _keys.HEAD_KEY,
 }
 _DEFAULT_NODE_FIELDS: Set[str] = {
     _keys.POSITIONS_KEY,
