@@ -8,7 +8,7 @@ from nequip.data import AtomicDataDict
 from nequip.utils import RankedLogger
 
 import warnings
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 
 logger = RankedLogger(__name__, rank_zero_only=True)
@@ -67,6 +67,8 @@ class NequIPLightningModule(lightning.LightningModule):
         test_metrics: Optional[Dict] = None,
         # for caching training info
         info_dict: Optional[Dict] = None,
+        # multi-head training
+        per_head_loss_weights: Optional[Dict[str, float]] = None,
     ):
         super().__init__()
 
@@ -115,10 +117,23 @@ class NequIPLightningModule(lightning.LightningModule):
         # === instantiate MetricsManager objects ===
         # must have separate MetricsManagers for each dataloader
         # num_datasets goes in order [train, val, test, predict]
-        self.num_datasets = num_datasets
-        assert self.num_datasets["train"] == 1, (
-            "currently only support one training dataset"
+        self.num_datasets = (
+            num_datasets
+            if num_datasets is not None
+            else {
+                "train": 0,
+                "val": 0,
+                "test": 0,
+                "predict": 0,
+            }
         )
+
+        assert self.num_datasets["train"] >= 1, (
+            "at least one training dataset is required"
+        )
+
+        # multi-head: per-head loss weights (defaults to uniform)
+        self.per_head_loss_weights = per_head_loss_weights
 
         # == DDP concerns for loss ==
 
@@ -237,34 +252,73 @@ class NequIPLightningModule(lightning.LightningModule):
         return batch.copy()
 
     def training_step(
-        self, batch: AtomicDataDict.Type, batch_idx: int, dataloader_idx: int = 0
+        self, batch, batch_idx: int, dataloader_idx: int = 0
     ):
         """"""
-        target = self.process_target(batch, batch_idx, dataloader_idx)
-        output = self(batch)
+        if isinstance(batch, dict) and self.num_datasets["train"] > 1:
+            # Multi-head: CombinedLoader gives dict of batches keyed by str(index)
+            total_loss = 0.0
+            for head_key, head_batch in batch.items():
+                target = self.process_target(head_batch, batch_idx, dataloader_idx)
+                output = self(head_batch)
 
-        # optionally compute training metrics
-        if self.train_metrics is not None:
-            with torch.no_grad():
-                train_metric_dict = self.train_metrics(
-                    output, target, prefix=f"train_metric_step{self.logging_delimiter}"
+                # optionally compute training metrics (per-head prefixed)
+                if self.train_metrics is not None:
+                    with torch.no_grad():
+                        train_metric_dict = self.train_metrics(
+                            output,
+                            target,
+                            prefix=f"train_metric_step_head{head_key}{self.logging_delimiter}",
+                        )
+                    self.log_dict(train_metric_dict)
+
+                # compute loss
+                loss_dict = self.loss(
+                    output,
+                    target,
+                    prefix=f"train_loss_step_head{head_key}{self.logging_delimiter}",
                 )
-            self.log_dict(train_metric_dict)
+                self.log_dict(loss_dict)
 
-        # compute loss and return
-        loss_dict = self.loss(
-            output, target, prefix=f"train_loss_step{self.logging_delimiter}"
-        )
-        self.log_dict(loss_dict)
-        # In DDP training, because gradients are averaged rather than summed over nodes,
-        # we get an effective factor of 1/n_rank applied to the loss. Because our loss already
-        # manages correct accumulation of the metric over ranks, we want to cancel out this
-        # unnecessary 1/n_rank term. If DDP is disabled, this is 1 and has no effect.
-        loss = (
-            loss_dict[f"train_loss_step{self.logging_delimiter}weighted_sum"]
-            * self.world_size
-        )
-        return loss
+                head_loss = loss_dict[
+                    f"train_loss_step_head{head_key}{self.logging_delimiter}weighted_sum"
+                ]
+
+                # apply per-head loss weight
+                if self.per_head_loss_weights is not None:
+                    weight = self.per_head_loss_weights.get(head_key, 1.0)
+                    head_loss = head_loss * weight
+
+                total_loss = total_loss + head_loss
+
+            return total_loss * self.world_size
+        else:
+            # Single-head: original path
+            target = self.process_target(batch, batch_idx, dataloader_idx)
+            output = self(batch)
+
+            # optionally compute training metrics
+            if self.train_metrics is not None:
+                with torch.no_grad():
+                    train_metric_dict = self.train_metrics(
+                        output, target, prefix=f"train_metric_step{self.logging_delimiter}"
+                    )
+                self.log_dict(train_metric_dict)
+
+            # compute loss and return
+            loss_dict = self.loss(
+                output, target, prefix=f"train_loss_step{self.logging_delimiter}"
+            )
+            self.log_dict(loss_dict)
+            # In DDP training, because gradients are averaged rather than summed over nodes,
+            # we get an effective factor of 1/n_rank applied to the loss. Because our loss already
+            # manages correct accumulation of the metric over ranks, we want to cancel out this
+            # unnecessary 1/n_rank term. If DDP is disabled, this is 1 and has no effect.
+            loss = (
+                loss_dict[f"train_loss_step{self.logging_delimiter}weighted_sum"]
+                * self.world_size
+            )
+            return loss
 
     def on_train_epoch_end(self):
         """"""

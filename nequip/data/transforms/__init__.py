@@ -13,6 +13,7 @@ from .stress_utils import (
 from .cell_utils import (
     NonPeriodicCellTransform,
 )
+from .head_stamper import HeadStamper
 
 __all__ = [
     "ChemicalSpeciesToAtomTypeMapper",
@@ -23,4 +24,5 @@ __all__ = [
     "StressSignFlipTransform",
     "AddNaNStressTransform",
     "NonPeriodicCellTransform",
+    "HeadStamper",
 ]

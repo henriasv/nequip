@@ -1,0 +1,119 @@
+run: [train]
+
+seed: 1
+cutoff_radius: 5.0
+model_type_names: [Cu, Al]
+chemical_species: ${model_type_names}
+per_edge_type_cutoff: null
+
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: 5
+
+data:
+  _target_: nequip.data.datamodule.NequIPDataModule
+  seed: ${seed}
+  combined_loader_mode: max_size_cycle
+  train_dataset:
+    - _target_: nequip.data.dataset.EMTTestDataset
+      transforms:
+        - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+          model_type_names: ${model_type_names}
+          chemical_species_to_atom_type_map:
+            Cu: Cu
+        - _target_: nequip.data.transforms.NeighborListTransform
+          r_max: ${cutoff_radius}
+        - _target_: nequip.data.transforms.HeadStamper
+          head_index: 0
+      supercell: [2, 2, 2]
+      seed: ${seed}
+      num_frames: 20
+      element: Cu
+    - _target_: nequip.data.dataset.EMTTestDataset
+      transforms:
+        - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+          model_type_names: ${model_type_names}
+          chemical_species_to_atom_type_map:
+            Al: Al
+        - _target_: nequip.data.transforms.NeighborListTransform
+          r_max: ${cutoff_radius}
+        - _target_: nequip.data.transforms.HeadStamper
+          head_index: 1
+      supercell: [2, 2, 2]
+      seed: ${seed}
+      num_frames: 20
+      element: Al
+  val_dataset:
+    - _target_: nequip.data.dataset.EMTTestDataset
+      transforms:
+        - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+          model_type_names: ${model_type_names}
+          chemical_species_to_atom_type_map:
+            Cu: Cu
+        - _target_: nequip.data.transforms.NeighborListTransform
+          r_max: ${cutoff_radius}
+        - _target_: nequip.data.transforms.HeadStamper
+          head_index: 0
+      supercell: [2, 2, 2]
+      seed: 999
+      num_frames: 5
+      element: Cu
+  train_dataloader: ${dataloader}
+  val_dataloader: ${dataloader}
+  stats_manager:
+    _target_: nequip.data.CommonDataStatisticsManager
+    type_names: ${model_type_names}
+
+trainer:
+  _target_: lightning.Trainer
+  max_epochs: 3
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 5
+  callbacks:
+    - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      monitor: val0_epoch/weighted_sum
+      dirpath: ${hydra:runtime.output_dir}
+      filename: best
+      save_last: true
+
+num_features: 8
+
+training_module:
+  _target_: nequip.train.EMALightningModule
+  loss:
+    _target_: nequip.train.EnergyForceStressLoss
+    per_atom_energy: true
+    coeffs:
+      total_energy: 1.0
+      forces: 1.0
+      stress: 1.0
+  val_metrics:
+    _target_: nequip.train.EnergyForceStressMetrics
+    coeffs:
+      total_energy_mae: 1.0
+      forces_mae: 1.0
+      stress_mae: 1.0
+  train_metrics: ${training_module.val_metrics}
+  optimizer:
+    _target_: torch.optim.Adam
+    lr: 0.01
+  model:
+    _target_: nequip.model.NequIPGNNModel
+    seed: ${seed}
+    model_dtype: float64
+    type_names: ${model_type_names}
+    r_max: ${cutoff_radius}
+    l_max: 1
+    parity: true
+    num_layers: 2
+    num_features: ${num_features}
+    radial_mlp_depth: 1
+    radial_mlp_width: 8
+    avg_num_neighbors: ${training_data_stats:num_neighbors_mean}
+    head_names: [Cu_head, Al_head]
+    per_head_energy_shifts:
+      Cu_head: ${training_data_stats:per_atom_energy_mean}
+      Al_head: ${training_data_stats:per_atom_energy_mean}
+    per_head_energy_scales:
+      Cu_head: ${training_data_stats:forces_rms}
+      Al_head: ${training_data_stats:forces_rms}

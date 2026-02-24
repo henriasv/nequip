@@ -13,6 +13,7 @@ from nequip.nn import (
     ConvNetLayer,
     ForceStressOutput,
     ApplyFactor,
+    MultiHeadReadout,
 )
 from nequip.nn.embedding import (
     NodeTypeEmbed,
@@ -123,6 +124,10 @@ def NequIPGNNModel(
     type_embed_num_features: Optional[int] = None,
     radial_mlp_depth: int = 1,
     radial_mlp_width: int = 128,
+    # multi-head params
+    head_names: Optional[List[str]] = None,
+    per_head_energy_scales: Optional[Dict[str, Union[float, Dict[str, float]]]] = None,
+    per_head_energy_shifts: Optional[Dict[str, Union[float, Dict[str, float]]]] = None,
     **kwargs,
 ) -> GraphModel:
     """NequIP GNN model that can predict energies only or energies with forces/stresses.
@@ -203,6 +208,9 @@ def NequIPGNNModel(
         feature_irreps_hidden=feature_irreps_hidden_list,
         radial_mlp_depth=radial_mlp_depth_list,
         radial_mlp_width=radial_mlp_width_list,
+        head_names=head_names,
+        per_head_energy_scales=per_head_energy_scales,
+        per_head_energy_shifts=per_head_energy_shifts,
         **kwargs,
     )
     return model
@@ -240,6 +248,10 @@ def FullNequIPGNNModel(
     per_type_energy_scales_trainable: Optional[bool] = False,
     per_type_energy_shifts_trainable: Optional[bool] = False,
     pair_potential: Optional[Dict] = None,
+    # multi-head params
+    head_names: Optional[List[str]] = None,
+    per_head_energy_scales: Optional[Dict[str, Union[float, Dict[str, float]]]] = None,
+    per_head_energy_shifts: Optional[Dict[str, Union[float, Dict[str, float]]]] = None,
     # derivatives
     do_derivatives: bool = True,
     # developmental params
@@ -361,53 +373,101 @@ def FullNequIPGNNModel(
     # === readout ===
     if readout_mlp_hidden_layers_width is None:
         readout_mlp_hidden_layers_width = o3.Irreps(feature_irreps_hidden[-1]).dim
-    per_atom_energy_readout = ScalarMLP(
-        output_dim=1,
-        hidden_layers_depth=readout_mlp_hidden_layers_depth,
-        hidden_layers_width=readout_mlp_hidden_layers_width,
-        nonlinearity=readout_mlp_nonlinearity,
-        bias=False,
-        forward_weight_init=True,
-        field=AtomicDataDict.NODE_FEATURES_KEY,
-        out_field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
-        irreps_in=prev_irreps_out,
-    )
 
-    per_type_energy_scale_shift = PerTypeScaleShift(
-        type_names=type_names,
-        field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
-        out_field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
-        scales=per_type_energy_scales,
-        shifts=per_type_energy_shifts,
-        scales_trainable=per_type_energy_scales_trainable,
-        shifts_trainable=per_type_energy_shifts_trainable,
-        irreps_in=per_atom_energy_readout.irreps_out,
-    )
+    if head_names is not None:
+        # === multi-head readout ===
+        if per_type_energy_scales is not None and not isinstance(
+            per_type_energy_scales, dict
+        ):
+            warnings.warn(
+                "When using multi-head, `per_type_energy_scales` should be a dict "
+                "mapping head names to scale values. Broadcasting single value to all heads."
+            )
+            per_head_energy_scales = {
+                name: per_type_energy_scales for name in head_names
+            }
+        if per_type_energy_shifts is not None and not isinstance(
+            per_type_energy_shifts, dict
+        ):
+            warnings.warn(
+                "When using multi-head, `per_type_energy_shifts` should be a dict "
+                "mapping head names to shift values. Broadcasting single value to all heads."
+            )
+            per_head_energy_shifts = {
+                name: per_type_energy_shifts for name in head_names
+            }
 
-    modules.update(
-        {
-            "per_atom_energy_readout": per_atom_energy_readout,
-            "per_type_energy_scale_shift": per_type_energy_scale_shift,
-        }
-    )
-
-    # === pair potentials ===
-    prev_irreps_out = per_type_energy_scale_shift.irreps_out
-    if pair_potential is not None:
-        pair_potential = instantiate(
-            pair_potential, type_names=type_names, irreps_in=prev_irreps_out
+        multihead_readout = MultiHeadReadout(
+            head_names=head_names,
+            type_names=type_names,
+            readout_mlp_hidden_layers_depth=readout_mlp_hidden_layers_depth,
+            readout_mlp_hidden_layers_width=readout_mlp_hidden_layers_width,
+            readout_mlp_nonlinearity=readout_mlp_nonlinearity,
+            per_head_energy_scales=per_head_energy_scales,
+            per_head_energy_shifts=per_head_energy_shifts,
+            per_type_energy_scales_trainable=per_type_energy_scales_trainable,
+            per_type_energy_shifts_trainable=per_type_energy_shifts_trainable,
+            irreps_in=prev_irreps_out,
         )
-        prev_irreps_out = pair_potential.irreps_out
-        modules.update({"pair_potential": pair_potential})
+        modules.update({"multihead_readout": multihead_readout})
+        prev_irreps_out = multihead_readout.irreps_out
 
-    # === sum to total energy ===
-    total_energy_sum = AtomwiseReduce(
-        irreps_in=prev_irreps_out,
-        reduce="sum",
-        field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
-        out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
-    )
-    modules.update({"total_energy_sum": total_energy_sum})
+        # pair potentials with multi-head
+        if pair_potential is not None:
+            pair_potential = instantiate(
+                pair_potential, type_names=type_names, irreps_in=prev_irreps_out
+            )
+            prev_irreps_out = pair_potential.irreps_out
+            modules.update({"pair_potential": pair_potential})
+    else:
+        # === single-head readout (original behavior) ===
+        per_atom_energy_readout = ScalarMLP(
+            output_dim=1,
+            hidden_layers_depth=readout_mlp_hidden_layers_depth,
+            hidden_layers_width=readout_mlp_hidden_layers_width,
+            nonlinearity=readout_mlp_nonlinearity,
+            bias=False,
+            forward_weight_init=True,
+            field=AtomicDataDict.NODE_FEATURES_KEY,
+            out_field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
+            irreps_in=prev_irreps_out,
+        )
+
+        per_type_energy_scale_shift = PerTypeScaleShift(
+            type_names=type_names,
+            field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
+            out_field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
+            scales=per_type_energy_scales,
+            shifts=per_type_energy_shifts,
+            scales_trainable=per_type_energy_scales_trainable,
+            shifts_trainable=per_type_energy_shifts_trainable,
+            irreps_in=per_atom_energy_readout.irreps_out,
+        )
+
+        modules.update(
+            {
+                "per_atom_energy_readout": per_atom_energy_readout,
+                "per_type_energy_scale_shift": per_type_energy_scale_shift,
+            }
+        )
+
+        # === pair potentials ===
+        prev_irreps_out = per_type_energy_scale_shift.irreps_out
+        if pair_potential is not None:
+            pair_potential = instantiate(
+                pair_potential, type_names=type_names, irreps_in=prev_irreps_out
+            )
+            prev_irreps_out = pair_potential.irreps_out
+            modules.update({"pair_potential": pair_potential})
+
+        # === sum to total energy ===
+        total_energy_sum = AtomwiseReduce(
+            irreps_in=prev_irreps_out,
+            reduce="sum",
+            field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
+            out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
+        )
+        modules.update({"total_energy_sum": total_energy_sum})
 
     # === finalize ===
     energy_model = SequentialGraphNetwork(modules)
