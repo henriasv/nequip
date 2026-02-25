@@ -16,6 +16,13 @@ from nequip.nn import (
 from nequip.utils import find_first_of_type
 
 
+def _is_instance_by_name(obj, cls):
+    """Check isinstance, falling back to class name for torch.package compatibility."""
+    if isinstance(obj, cls):
+        return True
+    return type(obj).__name__ == cls.__name__ and hasattr(obj, "__module__")
+
+
 def extract_head(model: GraphModel, head_name: str) -> GraphModel:
     """Extract a single head from a multi-head model into a standalone single-head model.
 
@@ -49,7 +56,7 @@ def extract_head(model: GraphModel, head_name: str) -> GraphModel:
     # Walk the model tree to find MultiHeadReadout
     def _find_mhr(module, parent_name=""):
         nonlocal seq_net, mhr, mhr_name
-        if isinstance(module, MultiHeadReadout):
+        if _is_instance_by_name(module, MultiHeadReadout):
             mhr = module
             mhr_name = parent_name
             return
@@ -74,9 +81,9 @@ def extract_head(model: GraphModel, head_name: str) -> GraphModel:
     # Find the SequentialGraphNetwork that contains the MultiHeadReadout
     # Navigate to it by finding the parent
     def _find_seq_and_replace(module):
-        if isinstance(module, SequentialGraphNetwork):
+        if _is_instance_by_name(module, SequentialGraphNetwork):
             for name, child in module.named_children():
-                if isinstance(child, MultiHeadReadout):
+                if _is_instance_by_name(child, MultiHeadReadout):
                     return module, name
         for name, child in module.named_children():
             result = _find_seq_and_replace(child)

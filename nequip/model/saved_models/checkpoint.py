@@ -107,6 +107,9 @@ def data_dict_from_checkpoint(ckpt_path: str) -> AtomicDataDict.Type:
             datamodule.setup(stage="fit")
             dloader = datamodule.train_dataloader()
             for data in dloader:
+                # Multi-head CombinedLoader yields (dict_of_batches, batch_idx, dataloader_idx)
+                if isinstance(data, tuple):
+                    data = next(iter(data[0].values()))
                 if AtomicDataDict.num_nodes(data) > 3:
                     break
         finally:

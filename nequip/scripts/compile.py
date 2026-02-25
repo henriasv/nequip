@@ -108,6 +108,13 @@ def main(args=None):
         default=[],
     )
 
+    parser.add_argument(
+        "--head",
+        help="extract and compile only this head from a multi-head model (e.g. --head rpa)",
+        type=str,
+        default=None,
+    )
+
     # args specific to export
     parser.add_argument(
         "--target",
@@ -211,6 +218,40 @@ def main(args=None):
     )
     if need_data_from_model:
         model, data_from_loaded_model = model
+
+    # === multi-head detection and extraction ===
+    from nequip.utils import find_first_of_type
+    from nequip.nn import MultiHeadReadout
+
+    mhr = find_first_of_type(model, MultiHeadReadout)
+    # torch.package creates classes in a different namespace, so isinstance fails;
+    # fall back to class name matching for package-loaded models
+    if mhr is None:
+        for _mod in model.modules():
+            if type(_mod).__name__ == "MultiHeadReadout" and hasattr(
+                _mod, "head_names"
+            ):
+                mhr = _mod
+                break
+    if mhr is not None and args.head is None:
+        raise ValueError(
+            f"This is a multi-head model with heads: {mhr.head_names}. "
+            f"Use --head <name> to select which head to compile.\n"
+            f"Example: nequip-compile {args.input_path} {args.output_path} "
+            f"--mode {args.mode} --device {args.device} --head {mhr.head_names[0]}"
+        )
+    if args.head is not None:
+        from nequip.model.extract_head import extract_head
+
+        if mhr is None:
+            raise ValueError(
+                f"--head '{args.head}' was specified, but this is not a multi-head model."
+            )
+        logger.info(
+            f"Extracting head '{args.head}' from multi-head model "
+            f"(available: {mhr.head_names})"
+        )
+        model = extract_head(model, args.head)
 
     # === modify model ===
     # for now, we restrict modifiers to those without arguments, i.e. accelerations
