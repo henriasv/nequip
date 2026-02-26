@@ -7,7 +7,7 @@ from nequip.data import AtomicDataDict
 from nequip.data.dict import from_dict
 from nequip.data.transforms import ChemicalSpeciesToAtomTypeMapper, NeighborListTransform
 from nequip.nn import MultiHeadReadout
-from nequip.model.extract_head import extract_head
+from nequip.model.extract_head import extract_head, extract_summed_heads, SummedHeadsReadout
 from nequip.utils.global_state import set_global_state
 from nequip.utils import find_first_of_type
 
@@ -192,3 +192,212 @@ def test_original_model_unchanged():
     # Check MultiHeadReadout still present in original
     mhr = find_first_of_type(model, MultiHeadReadout)
     assert mhr is not None
+
+
+# === Shared Readout extract_head Tests ===
+
+
+def _build_shared_readout_model():
+    config = {
+        "_target_": "nequip.model.NequIPGNNModel",
+        "l_max": 1,
+        "parity": True,
+        "num_features": 8,
+        "num_layers": 2,
+        "radial_mlp_depth": 1,
+        "radial_mlp_width": 8,
+        "head_names": ["HF", "MP2"],
+        "shared_readout": True,
+        "per_head_energy_scales": {"HF": 1.0, "MP2": 2.0},
+        "per_head_energy_shifts": {
+            "HF": {"H": 1.0, "C": 2.0},
+            "MP2": {"H": 0.5, "C": 1.5},
+        },
+        **BASIC_INFO,
+    }
+    config = copy.deepcopy(config)
+    builder = get_method(config.pop("_target_"))
+    return builder(**config)
+
+
+def test_extract_shared_readout_head_no_multihead():
+    """Extracted model from shared readout should not contain MultiHeadReadout."""
+    model = _build_shared_readout_model()
+    extracted = extract_head(model, "HF")
+    mhr = find_first_of_type(extracted, MultiHeadReadout)
+    assert mhr is None
+
+
+def test_extract_shared_readout_head_identical_output():
+    """Extracted shared readout head should produce identical output to multi-head model."""
+    model = _build_shared_readout_model()
+
+    torch.manual_seed(42)
+    data = _make_data(head_index=0, seed=42)
+
+    out_multi = model(data.copy())
+    extracted = extract_head(model, "HF")
+    out_single = extracted(data.copy())
+
+    torch.testing.assert_close(
+        out_multi[AtomicDataDict.TOTAL_ENERGY_KEY],
+        out_single[AtomicDataDict.TOTAL_ENERGY_KEY],
+    )
+    torch.testing.assert_close(
+        out_multi[AtomicDataDict.FORCE_KEY],
+        out_single[AtomicDataDict.FORCE_KEY],
+    )
+
+
+def test_extract_shared_readout_second_head():
+    """Extracting the second head from shared readout model should match."""
+    model = _build_shared_readout_model()
+
+    torch.manual_seed(42)
+    data = _make_data(head_index=1, seed=42)
+
+    out_multi = model(data.copy())
+    extracted = extract_head(model, "MP2")
+    out_single = extracted(data.copy())
+
+    torch.testing.assert_close(
+        out_multi[AtomicDataDict.TOTAL_ENERGY_KEY],
+        out_single[AtomicDataDict.TOTAL_ENERGY_KEY],
+    )
+
+
+# === Summed Heads Tests ===
+
+
+def test_extract_summed_heads_no_multihead():
+    """Extracted summed model should not contain MultiHeadReadout."""
+    model = _build_multihead_model()
+    extracted = extract_summed_heads(model, ["HF", "MP2"])
+
+    mhr = find_first_of_type(extracted, MultiHeadReadout)
+    assert mhr is None
+
+    # Should contain SummedHeadsReadout
+    found = find_first_of_type(extracted, SummedHeadsReadout)
+    assert found is not None
+
+
+def test_extract_summed_heads_equals_sum():
+    """Summed model output should equal sum of individually-extracted heads' per-atom energies."""
+    model = _build_multihead_model()
+
+    torch.manual_seed(42)
+    data = _make_data(head_index=0, seed=42)
+
+    # Extract individual heads
+    head_hf = extract_head(model, "HF")
+    head_mp2 = extract_head(model, "MP2")
+
+    # Extract summed model
+    summed = extract_summed_heads(model, ["HF", "MP2"])
+
+    # Run each individually (no HEAD_KEY needed)
+    data_copy = data.copy()
+    del data_copy[AtomicDataDict.HEAD_KEY]
+
+    out_hf = head_hf(data_copy.copy())
+    out_mp2 = head_mp2(data_copy.copy())
+    out_summed = summed(data_copy.copy())
+
+    expected_energy = (
+        out_hf[AtomicDataDict.TOTAL_ENERGY_KEY]
+        + out_mp2[AtomicDataDict.TOTAL_ENERGY_KEY]
+    )
+
+    torch.testing.assert_close(
+        out_summed[AtomicDataDict.TOTAL_ENERGY_KEY],
+        expected_energy,
+    )
+
+
+def test_extract_summed_heads_forces():
+    """Summed model should produce finite forces consistent with autograd of summed energy."""
+    model = _build_multihead_model()
+
+    torch.manual_seed(42)
+    data = _make_data(head_index=0, seed=42)
+    del data[AtomicDataDict.HEAD_KEY]
+
+    summed = extract_summed_heads(model, ["HF", "MP2"])
+    out = summed(data.copy())
+
+    assert AtomicDataDict.FORCE_KEY in out
+    assert torch.isfinite(out[AtomicDataDict.FORCE_KEY]).all()
+
+    # Forces should equal sum of individual heads' forces
+    head_hf = extract_head(model, "HF")
+    head_mp2 = extract_head(model, "MP2")
+    out_hf = head_hf(data.copy())
+    out_mp2 = head_mp2(data.copy())
+    expected_forces = (
+        out_hf[AtomicDataDict.FORCE_KEY] + out_mp2[AtomicDataDict.FORCE_KEY]
+    )
+    torch.testing.assert_close(
+        out[AtomicDataDict.FORCE_KEY],
+        expected_forces,
+    )
+
+
+def test_extract_summed_heads_no_head_key():
+    """Summed model should work without HEAD_KEY in input."""
+    model = _build_multihead_model()
+
+    torch.manual_seed(42)
+    data = _make_data(head_index=0, seed=42)
+    del data[AtomicDataDict.HEAD_KEY]
+
+    summed = extract_summed_heads(model, ["HF", "MP2"])
+    out = summed(data)
+
+    assert AtomicDataDict.TOTAL_ENERGY_KEY in out
+    assert AtomicDataDict.FORCE_KEY in out
+    assert torch.isfinite(out[AtomicDataDict.TOTAL_ENERGY_KEY]).all()
+    assert torch.isfinite(out[AtomicDataDict.FORCE_KEY]).all()
+
+
+def test_extract_summed_heads_shared_readout():
+    """Summed model from shared readout should match sum of individual heads."""
+    model = _build_shared_readout_model()
+
+    torch.manual_seed(42)
+    data = _make_data(head_index=0, seed=42)
+    del data[AtomicDataDict.HEAD_KEY]
+
+    head_hf = extract_head(model, "HF")
+    head_mp2 = extract_head(model, "MP2")
+    summed = extract_summed_heads(model, ["HF", "MP2"])
+
+    out_hf = head_hf(data.copy())
+    out_mp2 = head_mp2(data.copy())
+    out_summed = summed(data.copy())
+
+    expected_energy = (
+        out_hf[AtomicDataDict.TOTAL_ENERGY_KEY]
+        + out_mp2[AtomicDataDict.TOTAL_ENERGY_KEY]
+    )
+
+    torch.testing.assert_close(
+        out_summed[AtomicDataDict.TOTAL_ENERGY_KEY],
+        expected_energy,
+    )
+
+    # Forces should also match
+    expected_forces = (
+        out_hf[AtomicDataDict.FORCE_KEY] + out_mp2[AtomicDataDict.FORCE_KEY]
+    )
+    torch.testing.assert_close(
+        out_summed[AtomicDataDict.FORCE_KEY],
+        expected_forces,
+    )
+
+
+def test_extract_summed_heads_invalid_name():
+    """Extracting with a non-existent head should raise ValueError."""
+    model = _build_multihead_model()
+    with pytest.raises(ValueError, match="not found"):
+        extract_summed_heads(model, ["HF", "CCSD"])

@@ -168,6 +168,60 @@ trainer:
       save_last: true
 ```
 
+### Force transfer for energy-only heads
+
+A common multi-head scenario is training one head with energies and forces (e.g. DFT/PBE) and another with energies only (e.g. RPA or hybrid DFT). While the energy-only head can learn accurate total energies, its autograd forces may be poor because the per-atom energy decomposition is unconstrained: the total energy provides only one constraint per frame, but N atoms have N-1 unconstrained degrees of freedom. The readout MLP can redistribute energy among atoms freely without affecting the total, corrupting the position gradients.
+
+NequIP provides two techniques to improve force quality for energy-only heads. They can be used independently or together.
+
+#### Shared readout
+
+When `shared_readout: true`, a single shared readout MLP produces the base per-atom energies, and each head adds a small per-head correction. Force supervision from the force-supervised head constrains the shared readout's per-atom decomposition, and the energy-only head inherits that structure.
+
+```yaml
+training_module:
+  model:
+    _target_: nequip.model.NequIPGNNModel
+    head_names: [dft, rpa]
+    shared_readout: true    # shared readout MLP + per-head corrections
+    # ... other hyperparameters ...
+```
+
+#### Cross-head force regularization
+
+Cross-head force regularization adds a penalty that encourages the energy-only head's predicted forces to match the force-supervised head's predicted forces on the same structures. This is implemented as an additional MSE loss term in the training step.
+
+```yaml
+training_module:
+  cross_head_force_reg:
+    lambda: 0.01              # regularization weight (tune this)
+    reference_head: "0"       # head with force supervision (dataloader index)
+    target_heads: ["1"]       # energy-only heads to regularize
+```
+
+The `reference_head` specifies which head's predicted forces serve as the reference (detached, so no gradient flows back to the reference head from this term). The `target_heads` list specifies which heads receive the regularization gradient.
+
+#### Combining both techniques
+
+Both techniques can be used together for maximum effect:
+
+```yaml
+training_module:
+  model:
+    _target_: nequip.model.NequIPGNNModel
+    head_names: [dft, rpa]
+    shared_readout: true
+    # ... other hyperparameters ...
+  cross_head_force_reg:
+    lambda: 0.01
+    reference_head: "0"
+    target_heads: ["1"]
+```
+
+```{tip}
+Start with `shared_readout: true` alone, as it adds no extra hyperparameters. If force quality for the energy-only head is still insufficient, add `cross_head_force_reg` and tune `lambda` (typical range: 0.001--0.1).
+```
+
 ### Packaging and compilation
 
 Multi-head models follow the standard [workflow](../getting-started/workflow.md) with one additional step: you select which head to compile for deployment.
@@ -195,6 +249,16 @@ nequip-compile model.nequip.zip rpa.nequip.pth \
 ```
 
 The compiled model is a standard single-head model and can be used with any [integration](../../integrations/all.rst) (ASE, LAMMPS, etc.) without any multi-head awareness downstream.
+
+**Compile a summed model** for delta-learning deployment using `+`:
+
+```bash
+# Deploy E_dft + E_rpa_delta as a single model
+nequip-compile model.nequip.zip target.nequip.pth \
+  --mode torchscript --device cuda --target ase --head dft+rpa_delta
+```
+
+When `+` is used, each head's readout and scale/shift pipeline runs independently and the resulting per-atom energies are summed. This is useful for delta-learning workflows where the base head (e.g. DFT with forces) and a correction head (e.g. RPA−DFT, energy-only) are trained jointly, and the deployed model should predict the target-level energy surface ``E_base + E_delta``. Forces are computed via autograd of the summed energy.
 
 ```{important}
 Compiling a multi-head model without `--head` will raise an error listing the available heads. Conversely, using `--head` on a single-head model will also raise an error.

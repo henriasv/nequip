@@ -110,7 +110,8 @@ def main(args=None):
 
     parser.add_argument(
         "--head",
-        help="extract and compile only this head from a multi-head model (e.g. --head rpa)",
+        help="extract and compile a head from a multi-head model (e.g. --head rpa). "
+        "Use + to sum multiple heads for delta-learning deployment (e.g. --head dft+rpa_delta)",
         type=str,
         default=None,
     )
@@ -236,22 +237,33 @@ def main(args=None):
     if mhr is not None and args.head is None:
         raise ValueError(
             f"This is a multi-head model with heads: {mhr.head_names}. "
-            f"Use --head <name> to select which head to compile.\n"
+            f"Use --head <name> to select which head to compile, "
+            f"or --head name1+name2 to sum multiple heads.\n"
             f"Example: nequip-compile {args.input_path} {args.output_path} "
             f"--mode {args.mode} --device {args.device} --head {mhr.head_names[0]}"
         )
     if args.head is not None:
-        from nequip.model.extract_head import extract_head
-
         if mhr is None:
             raise ValueError(
                 f"--head '{args.head}' was specified, but this is not a multi-head model."
             )
-        logger.info(
-            f"Extracting head '{args.head}' from multi-head model "
-            f"(available: {mhr.head_names})"
-        )
-        model = extract_head(model, args.head)
+        head_names = args.head.split("+")
+        if len(head_names) > 1:
+            from nequip.model.extract_head import extract_summed_heads
+
+            logger.info(
+                f"Extracting and summing heads {head_names} from multi-head model "
+                f"(available: {mhr.head_names})"
+            )
+            model = extract_summed_heads(model, head_names)
+        else:
+            from nequip.model.extract_head import extract_head
+
+            logger.info(
+                f"Extracting head '{args.head}' from multi-head model "
+                f"(available: {mhr.head_names})"
+            )
+            model = extract_head(model, args.head)
 
     # === modify model ===
     # for now, we restrict modifiers to those without arguments, i.e. accelerations
