@@ -69,6 +69,7 @@ class NequIPLightningModule(lightning.LightningModule):
         info_dict: Optional[Dict] = None,
         # multi-head training
         per_head_loss_weights: Optional[Dict[str, float]] = None,
+        cross_head_force_reg: Optional[Dict] = None,
     ):
         super().__init__()
 
@@ -134,6 +135,9 @@ class NequIPLightningModule(lightning.LightningModule):
 
         # multi-head: per-head loss weights (defaults to uniform)
         self.per_head_loss_weights = per_head_loss_weights
+
+        # multi-head: cross-head force regularization
+        self.cross_head_force_reg = cross_head_force_reg
 
         # == DDP concerns for loss ==
 
@@ -258,9 +262,11 @@ class NequIPLightningModule(lightning.LightningModule):
         if isinstance(batch, dict) and self.num_datasets["train"] > 1:
             # Multi-head: CombinedLoader gives dict of batches keyed by str(index)
             total_loss = 0.0
+            outputs = {}
             for head_key, head_batch in batch.items():
                 target = self.process_target(head_batch, batch_idx, dataloader_idx)
                 output = self(head_batch)
+                outputs[head_key] = output
 
                 # optionally compute training metrics (per-head prefixed)
                 if self.train_metrics is not None:
@@ -290,6 +296,93 @@ class NequIPLightningModule(lightning.LightningModule):
                     head_loss = head_loss * weight
 
                 total_loss = total_loss + head_loss
+
+            # Cross-head force regularization: penalize target heads' forces
+            # toward a reference. Supports two config formats:
+            #
+            # Single-reference (all targets share one reference):
+            #   cross_head_force_reg:
+            #     reference_head: "0"    # or "zero" for L2 magnitude penalty
+            #     target_heads: ["1", "2"]
+            #     lambda: 0.01
+            #
+            # Per-target references (each target can have its own reference):
+            #   cross_head_force_reg:
+            #     terms:
+            #       - reference_head: "0"
+            #         target_head: "1"
+            #         lambda: 0.01
+            #       - reference_head: "zero"
+            #         target_head: "2"
+            #         lambda: 0.001
+            if self.cross_head_force_reg is not None:
+                # Normalize config to list of (ref, target, lambda) terms
+                reg_terms = []
+                if "terms" in self.cross_head_force_reg:
+                    for term in self.cross_head_force_reg["terms"]:
+                        reg_terms.append((
+                            term["reference_head"],
+                            term["target_head"],
+                            term["lambda"],
+                        ))
+                else:
+                    ref_key = self.cross_head_force_reg["reference_head"]
+                    lam = self.cross_head_force_reg["lambda"]
+                    for target_key in self.cross_head_force_reg["target_heads"]:
+                        reg_terms.append((ref_key, target_key, lam))
+
+                # Cache ref forces per reference head to avoid recomputation
+                ref_forces_cache = {}
+
+                for ref_key, target_key, lam in reg_terms:
+                    use_zero_ref = ref_key == "zero"
+
+                    # Get source batch (structures to evaluate on)
+                    if use_zero_ref:
+                        source_batch = None
+                        for hk in batch:
+                            source_batch = batch[hk]
+                            break
+                    else:
+                        source_batch = batch.get(ref_key, None)
+
+                    if source_batch is None:
+                        continue
+
+                    # Get reference forces (cached)
+                    if not use_zero_ref and ref_key not in ref_forces_cache:
+                        ref_output = outputs.get(ref_key, None)
+                        if ref_output is None:
+                            ref_output = self(source_batch)
+                        ref_forces_cache[ref_key] = ref_output[
+                            AtomicDataDict.FORCE_KEY
+                        ].detach()
+
+                    # Run target head on source batch structures
+                    target_head_idx = int(target_key)
+                    reg_batch = {
+                        k: v.clone() if isinstance(v, torch.Tensor) else v
+                        for k, v in source_batch.items()
+                    }
+                    reg_batch[AtomicDataDict.HEAD_KEY] = torch.full_like(
+                        source_batch[AtomicDataDict.HEAD_KEY],
+                        target_head_idx,
+                    )
+                    reg_output = self(reg_batch)
+                    reg_forces = reg_output[AtomicDataDict.FORCE_KEY]
+
+                    if use_zero_ref:
+                        force_reg_loss = torch.mean(reg_forces**2)
+                    else:
+                        force_reg_loss = torch.nn.functional.mse_loss(
+                            reg_forces, ref_forces_cache[ref_key]
+                        )
+                    total_loss = total_loss + lam * force_reg_loss
+
+                    self.log(
+                        f"train_loss_step{self.logging_delimiter}force_reg_head{target_key}",
+                        force_reg_loss,
+                    )
 
             return total_loss * self.world_size
         else:

@@ -20,6 +20,11 @@ class MultiHeadReadout(GraphModuleMixin, torch.nn.Module):
 
     If ``HEAD_KEY`` is absent from the data, head 0 is used (backward compat).
 
+    When ``shared_readout=True``, a single shared ``ScalarMLP`` produces per-atom
+    energies that receive gradients from ALL heads (including force-supervised ones).
+    Each head adds a small per-head correction on top. This constrains the per-atom
+    energy decomposition, improving autograd forces for energy-only heads.
+
     Args:
         head_names: list of head name strings (e.g. ``["HF", "MP2"]``)
         type_names: list of atom type names
@@ -30,6 +35,7 @@ class MultiHeadReadout(GraphModuleMixin, torch.nn.Module):
         per_head_energy_shifts: dict mapping head_name to shifts (float or Dict[str, float])
         per_type_energy_scales_trainable: whether scales are trainable
         per_type_energy_shifts_trainable: whether shifts are trainable
+        shared_readout: if True, use a shared readout MLP + per-head corrections
         irreps_in: input irreps dict
     """
 
@@ -48,19 +54,35 @@ class MultiHeadReadout(GraphModuleMixin, torch.nn.Module):
         ] = None,
         per_type_energy_scales_trainable: bool = False,
         per_type_energy_shifts_trainable: bool = False,
+        shared_readout: bool = False,
         irreps_in=None,
     ):
         super().__init__()
         assert len(head_names) >= 1, "At least one head must be provided"
         self.head_names = head_names
         self.num_heads = len(head_names)
+        self.shared_readout_mode = shared_readout
 
         if per_head_energy_scales is None:
             per_head_energy_scales = {}
         if per_head_energy_shifts is None:
             per_head_energy_shifts = {}
 
-        # Build per-head readout + scale/shift modules
+        # Shared readout MLP (receives gradients from ALL heads)
+        if shared_readout:
+            self.shared_readout = ScalarMLP(
+                output_dim=1,
+                hidden_layers_depth=readout_mlp_hidden_layers_depth,
+                hidden_layers_width=readout_mlp_hidden_layers_width,
+                nonlinearity=readout_mlp_nonlinearity,
+                bias=False,
+                forward_weight_init=True,
+                field=AtomicDataDict.NODE_FEATURES_KEY,
+                out_field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
+                irreps_in=irreps_in,
+            )
+
+        # Build per-head readout (or correction) + scale/shift modules
         heads = {}
         for head_name in head_names:
             readout = ScalarMLP(
@@ -129,13 +151,30 @@ class MultiHeadReadout(GraphModuleMixin, torch.nn.Module):
 
         # Run each head and collect per-atom energies
         head_outputs = []
-        for head_name in self.head_names:
-            head_modules = self.heads[head_name]
-            # Make a copy of data so each head operates independently
-            head_data = data.copy()
-            head_data = head_modules["readout"](head_data)
-            head_data = head_modules["scale_shift"](head_data)
-            head_outputs.append(head_data[AtomicDataDict.PER_ATOM_ENERGY_KEY])
+        if self.shared_readout_mode:
+            # Shared readout: compute shared per-atom energy once, then add per-head corrections
+            shared_data = data.copy()
+            shared_data = self.shared_readout(shared_data)
+            shared_energy = shared_data[AtomicDataDict.PER_ATOM_ENERGY_KEY]
+
+            for head_name in self.head_names:
+                head_modules = self.heads[head_name]
+                head_data = data.copy()
+                head_data = head_modules["readout"](head_data)  # correction
+                correction = head_data[AtomicDataDict.PER_ATOM_ENERGY_KEY]
+                head_data[AtomicDataDict.PER_ATOM_ENERGY_KEY] = (
+                    shared_energy + correction
+                )
+                head_data = head_modules["scale_shift"](head_data)
+                head_outputs.append(head_data[AtomicDataDict.PER_ATOM_ENERGY_KEY])
+        else:
+            for head_name in self.head_names:
+                head_modules = self.heads[head_name]
+                # Make a copy of data so each head operates independently
+                head_data = data.copy()
+                head_data = head_modules["readout"](head_data)
+                head_data = head_modules["scale_shift"](head_data)
+                head_outputs.append(head_data[AtomicDataDict.PER_ATOM_ENERGY_KEY])
 
         # Stack and select: [n_atoms, n_heads, 1]
         stacked = torch.stack(head_outputs, dim=1)  # [n_atoms, n_heads, 1]

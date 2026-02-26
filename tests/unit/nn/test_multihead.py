@@ -63,7 +63,7 @@ def _make_data(
     return data
 
 
-def _make_multihead(feature_dim=8, num_types=2, head_names=None):
+def _make_multihead(feature_dim=8, num_types=2, head_names=None, shared_readout=False):
     """Create a MultiHeadReadout with given params."""
     if head_names is None:
         head_names = ["HF", "MP2"]
@@ -74,6 +74,7 @@ def _make_multihead(feature_dim=8, num_types=2, head_names=None):
     return MultiHeadReadout(
         head_names=head_names,
         type_names=[f"type{i}" for i in range(num_types)],
+        shared_readout=shared_readout,
         irreps_in=irreps_in,
     )
 
@@ -235,3 +236,144 @@ def test_single_head_matches_standard():
         out_mhr[AtomicDataDict.TOTAL_ENERGY_KEY],
         data_std[AtomicDataDict.TOTAL_ENERGY_KEY],
     )
+
+
+# === Shared Readout Tests ===
+
+
+def test_shared_readout_output_shapes():
+    """Shared readout should produce same output shapes as independent readout."""
+    mhr = _make_multihead(shared_readout=True)
+    data = _make_data(num_atoms=5, head_index=0)
+    out = mhr(data)
+
+    assert AtomicDataDict.PER_ATOM_ENERGY_KEY in out
+    assert AtomicDataDict.TOTAL_ENERGY_KEY in out
+    assert out[AtomicDataDict.PER_ATOM_ENERGY_KEY].shape == (5, 1)
+    assert out[AtomicDataDict.TOTAL_ENERGY_KEY].shape == (1, 1)
+
+
+def test_shared_readout_different_heads():
+    """Different heads should produce different outputs even with shared readout."""
+    mhr = _make_multihead(shared_readout=True)
+
+    data0 = _make_data(num_atoms=5, head_index=0, seed=42)
+    data1 = _make_data(num_atoms=5, head_index=1, seed=42)
+
+    out0 = mhr(data0)
+    out1 = mhr(data1)
+
+    # Corrections differ between heads, so outputs should differ
+    assert not torch.allclose(
+        out0[AtomicDataDict.PER_ATOM_ENERGY_KEY],
+        out1[AtomicDataDict.PER_ATOM_ENERGY_KEY],
+    )
+
+
+def test_shared_readout_backward():
+    """Backward pass should produce valid gradients with shared readout."""
+    mhr = _make_multihead(shared_readout=True)
+
+    data = _make_data(num_atoms=5, head_index=0, seed=42)
+    data[AtomicDataDict.NODE_FEATURES_KEY].requires_grad_(True)
+
+    out = mhr(data)
+    total_energy = out[AtomicDataDict.TOTAL_ENERGY_KEY]
+    total_energy.sum().backward()
+
+    grad = data[AtomicDataDict.NODE_FEATURES_KEY].grad
+    assert grad is not None
+    assert torch.isfinite(grad).all()
+
+
+def test_shared_readout_gradient_coupling():
+    """Loss from head 0 should produce gradients on shared readout parameters."""
+    mhr = _make_multihead(shared_readout=True)
+
+    data = _make_data(num_atoms=5, head_index=0, seed=42)
+    out = mhr(data)
+    loss = out[AtomicDataDict.TOTAL_ENERGY_KEY].sum()
+    loss.backward()
+
+    # Shared readout should have gradients from head 0's loss
+    for p in mhr.shared_readout.parameters():
+        assert p.grad is not None, "shared readout should receive gradients"
+        assert torch.isfinite(p.grad).all()
+
+    # Head 0's correction should have gradients
+    for p in mhr.heads["HF"]["readout"].parameters():
+        assert p.grad is not None, "head 0 correction should receive gradients"
+
+    # Head 1's correction should NOT have gradients (not selected)
+    for p in mhr.heads["MP2"]["readout"].parameters():
+        assert p.grad is None or torch.all(p.grad == 0), (
+            "head 1 correction should not receive gradients when head 0 is selected"
+        )
+
+
+def test_shared_readout_both_heads_gradient():
+    """Both heads' losses should produce gradients on the shared readout."""
+    mhr = _make_multihead(shared_readout=True)
+
+    # Forward pass for head 0
+    data0 = _make_data(num_atoms=5, head_index=0, seed=42)
+    out0 = mhr(data0)
+    loss0 = out0[AtomicDataDict.TOTAL_ENERGY_KEY].sum()
+
+    # Forward pass for head 1
+    data1 = _make_data(num_atoms=5, head_index=1, seed=42)
+    out1 = mhr(data1)
+    loss1 = out1[AtomicDataDict.TOTAL_ENERGY_KEY].sum()
+
+    # Combined loss
+    total_loss = loss0 + loss1
+    total_loss.backward()
+
+    # Shared readout receives gradients from BOTH heads
+    for p in mhr.shared_readout.parameters():
+        assert p.grad is not None
+        assert torch.isfinite(p.grad).all()
+
+    # Both heads' corrections should have gradients
+    for p in mhr.heads["HF"]["readout"].parameters():
+        assert p.grad is not None
+    for p in mhr.heads["MP2"]["readout"].parameters():
+        assert p.grad is not None
+
+
+def test_shared_readout_vs_independent():
+    """Shared and independent readout should produce different outputs (different architectures)."""
+    torch.manual_seed(0)
+    mhr_shared = _make_multihead(shared_readout=True)
+    torch.manual_seed(0)
+    mhr_indep = _make_multihead(shared_readout=False)
+
+    data_s = _make_data(num_atoms=5, head_index=0, seed=42)
+    data_i = _make_data(num_atoms=5, head_index=0, seed=42)
+
+    out_s = mhr_shared(data_s)
+    out_i = mhr_indep(data_i)
+
+    # Shared readout adds shared + correction, independent does not,
+    # so outputs should differ (even with same seed, the shared readout is an extra module)
+    assert not torch.allclose(
+        out_s[AtomicDataDict.TOTAL_ENERGY_KEY],
+        out_i[AtomicDataDict.TOTAL_ENERGY_KEY],
+    )
+
+
+def test_shared_readout_batched_mixed_heads():
+    """Shared readout should work with batched mixed-head data."""
+    mhr = _make_multihead(shared_readout=True)
+
+    num_atoms = 6  # 3 per frame
+    data = _make_data(
+        num_atoms=num_atoms,
+        head_index=[0, 1],
+        num_frames=2,
+        seed=42,
+    )
+    out = mhr(data)
+
+    assert out[AtomicDataDict.PER_ATOM_ENERGY_KEY].shape == (num_atoms, 1)
+    assert out[AtomicDataDict.TOTAL_ENERGY_KEY].shape == (2, 1)

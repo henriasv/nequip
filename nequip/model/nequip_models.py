@@ -128,6 +128,7 @@ def NequIPGNNModel(
     head_names: Optional[List[str]] = None,
     per_head_energy_scales: Optional[Dict[str, Union[float, Dict[str, float]]]] = None,
     per_head_energy_shifts: Optional[Dict[str, Union[float, Dict[str, float]]]] = None,
+    shared_readout: bool = False,
     **kwargs,
 ) -> GraphModel:
     """NequIP GNN model that can predict energies only or energies with forces/stresses.
@@ -158,6 +159,7 @@ def NequIPGNNModel(
         per_type_energy_shifts_trainable (bool): whether the per-atom energy shifts are trainable (default ``False``)
         pair_potential (torch.nn.Module): additional pair potential term, e.g. :class:`~nequip.nn.pair_potential.ZBL` (default ``None``)
         do_derivatives (bool): whether to compute forces and stresses via autograd (default ``True``)
+        shared_readout (bool): whether to use a shared readout MLP with per-head corrections in multi-head mode (default ``False``)
     """
     # === sanity checks and warnings ===
     assert num_layers > 0, (
@@ -211,6 +213,7 @@ def NequIPGNNModel(
         head_names=head_names,
         per_head_energy_scales=per_head_energy_scales,
         per_head_energy_shifts=per_head_energy_shifts,
+        shared_readout=shared_readout,
         **kwargs,
     )
     return model
@@ -252,6 +255,7 @@ def FullNequIPGNNModel(
     head_names: Optional[List[str]] = None,
     per_head_energy_scales: Optional[Dict[str, Union[float, Dict[str, float]]]] = None,
     per_head_energy_shifts: Optional[Dict[str, Union[float, Dict[str, float]]]] = None,
+    shared_readout: bool = False,
     # derivatives
     do_derivatives: bool = True,
     # developmental params
@@ -407,6 +411,7 @@ def FullNequIPGNNModel(
             per_head_energy_shifts=per_head_energy_shifts,
             per_type_energy_scales_trainable=per_type_energy_scales_trainable,
             per_type_energy_shifts_trainable=per_type_energy_shifts_trainable,
+            shared_readout=shared_readout,
             irreps_in=prev_irreps_out,
         )
         modules.update({"multihead_readout": multihead_readout})
