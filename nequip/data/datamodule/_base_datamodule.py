@@ -51,6 +51,7 @@ class NequIPDataModule(lightning.LightningDataModule):
         test_dataloader: Dict = {},
         predict_dataloader: Dict = {},
         stats_manager: Optional[Dict] = None,
+        combined_loader_mode: str = "max_size_cycle",
     ):
         super().__init__()
         # internal logic follows lists in order of train, val, test, predict, split
@@ -118,6 +119,9 @@ class NequIPDataModule(lightning.LightningDataModule):
                 self.num_datasets["predict"],
             )
         )
+
+        # == combined loader mode for multi-head training ==
+        self.combined_loader_mode = combined_loader_mode
 
         # == reproducibility params ==
         self.seed = seed
@@ -270,13 +274,25 @@ class NequIPDataModule(lightning.LightningDataModule):
     def train_dataloader(self):
         """"""
         if hasattr(self, "_train_dataloader"):
+            if self.num_datasets["train"] > 1:
+                return self._combined_train_dataloader
             return self._train_dataloader[0]
-        # must only return single train dataloader for now
-        # see https://lightning.ai/docs/pytorch/stable/data/iterables.html#multiple-dataloaders
         self._train_dataloader = self._get_dloader(
             self.train_dataset, self.train_generator, self.train_dataloader_config
         )
         self._maybe_load_dataloader_state_dict(self._train_dataloader, "train")
+        if self.num_datasets["train"] > 1:
+            # Return CombinedLoader for multi-head training
+            # see https://lightning.ai/docs/pytorch/stable/data/iterables.html#multiple-dataloaders
+            from lightning.pytorch.utilities.combined_loader import CombinedLoader
+
+            loader_dict = {
+                str(i): dl for i, dl in enumerate(self._train_dataloader)
+            }
+            self._combined_train_dataloader = CombinedLoader(
+                loader_dict, mode=self.combined_loader_mode
+            )
+            return self._combined_train_dataloader
         return self._train_dataloader[0]
 
     def val_dataloader(self):

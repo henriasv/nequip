@@ -10,7 +10,11 @@ Most recent change on the top.
 
 ### Added
 - `dataset` as a built-in `AtomicDataDict` graph/long field (`AtomicDataDict.DATASET_KEY`) and `nequip.data.transforms.DatasetIndexTransform` for multi-dataset workflows
-
+- multi-head training support with shared backbone and per-head readouts for multi-fidelity and delta-learning workflows
+- `HeadStamper` transform and `HEAD_KEY` for stamping per-frame head indices in multi-dataset training
+- `extract_head()` and `extract_summed_heads()` utilities for extracting single or summed heads from trained multi-head models
+- `nequip-compile --head` flag for compiling single heads (`--head dft`) or summed heads (`--head dft+rpa`) for deployment
+- multi-head training documentation
 
 ### Fixed
 - compatibility with `alchemiops` v0.3.0 neighborlist
