@@ -427,4 +427,11 @@ class PerHeadConvNetLayer(GraphModuleMixin, torch.nn.Module):
 
             data[f"_per_head_features_{head_name}"] = head_x
 
+        # Set NODE_FEATURES_KEY to the first head's output so that
+        # irreps_out validation passes in SequentialGraphNetwork.
+        # MultiHeadReadout will override this per-head anyway.
+        data[AtomicDataDict.NODE_FEATURES_KEY] = data[
+            f"_per_head_features_{self.head_names[0]}"
+        ]
+
         return data
