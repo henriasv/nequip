@@ -42,10 +42,7 @@ class SingleHeadConv(GraphModuleMixin, torch.nn.Module):
         self._activation = per_head_conv._activation
         # Per-head components
         self.head_modules = per_head_conv.heads[head_name]
-        self.register_buffer(
-            "_weight_indices",
-            getattr(per_head_conv, f"_weight_indices_{head_name}").clone(),
-        )
+        self._head_weight_numel = per_head_conv._head_weight_numels[head_name]
         self._init_irreps(
             irreps_in=per_head_conv.irreps_in,
             irreps_out=per_head_conv.irreps_out,
@@ -82,7 +79,7 @@ class SingleHeadConv(GraphModuleMixin, torch.nn.Module):
             x = data_copy[AtomicDataDict.NODE_FEATURES_KEY]
 
         edge_weights = self.edge_mlp(data[AtomicDataDict.EDGE_EMBEDDING_KEY])
-        head_weights = edge_weights[:, self._weight_indices]
+        head_weights = edge_weights[:, :self._head_weight_numel]
 
         x = self.head_modules["tp_scatter"](
             x=x,

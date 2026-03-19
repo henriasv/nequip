@@ -172,6 +172,7 @@ class PerHeadConvNetLayer(GraphModuleMixin, torch.nn.Module):
 
         heads = {}
         per_head_scalar_dims = {}
+        per_head_weight_numels = {}
 
         for head_name in head_names:
             head_l_max = per_head_l_max[head_name]
@@ -253,17 +254,31 @@ class PerHeadConvNetLayer(GraphModuleMixin, torch.nn.Module):
 
             heads[head_name] = head_modules
 
-            # Register weight indices as buffer
+            # Verify weight indices are contiguous from 0 (required for
+            # simple slicing instead of fancy indexing, which is needed
+            # for AOT Inductor compatibility)
+            expected = torch.arange(len(weight_indices), dtype=torch.long)
+            assert torch.equal(weight_indices, expected), (
+                f"Weight indices for head '{head_name}' are not contiguous from 0: "
+                f"{weight_indices.tolist()[:10]}... This indicates the TP instruction "
+                f"sorting does not put lower-l paths first."
+            )
+
+            # Register weight indices as buffer (kept for inspection/debugging)
             self.register_buffer(
                 f"_weight_indices_{head_name}",
                 weight_indices,
             )
+
+            # Track per-head weight count for contiguous slicing
+            per_head_weight_numels[head_name] = len(weight_indices)
 
             # Track output dimensions
             per_head_scalar_dims[head_name] = feature_irreps_out.dim
 
         self.heads = torch.nn.ModuleDict(heads)
         self.per_head_scalar_dims = per_head_scalar_dims
+        self._head_weight_numels = per_head_weight_numels
         self._activation = torch.nn.SiLU()
 
         # Set output irreps (scalar features, same dim for all heads since
@@ -402,9 +417,10 @@ class PerHeadConvNetLayer(GraphModuleMixin, torch.nn.Module):
         edge_src = data[AtomicDataDict.EDGE_INDEX_KEY][1]
 
         for head_name in self.head_names:
-            # Slice weights for this head
-            weight_indices = getattr(self, f"_weight_indices_{head_name}")
-            head_weights = edge_weights[:, weight_indices]
+            # Slice weights for this head (contiguous from 0 since TP
+            # instructions are sorted by l, lower-l paths come first)
+            head_weight_numel = self._head_weight_numels[head_name]
+            head_weights = edge_weights[:, :head_weight_numel]
 
             # TP + scatter
             head_x = self.heads[head_name]["tp_scatter"](

@@ -56,11 +56,6 @@ class TestPerHeadLMaxCompile:
         phc = find_first_of_type(model, PerHeadConvNetLayer)
         assert phc is not None, "Model should contain PerHeadConvNetLayer"
 
-    @pytest.mark.skip(
-        reason="AOT Inductor generates invalid C++ for weight indexing "
-        "pattern used by SingleHeadConv (PT 2.10 codegen bug with "
-        "'~' on bool in bounds check). Eager extraction verified by unit tests."
-    )
     def test_compile_each_head(self, per_head_lmax_ckpt):
         """Each head should compile and produce output matching eager inference."""
         from nequip.scripts.compile import main as compile_main
