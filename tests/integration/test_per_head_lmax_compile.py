@@ -83,7 +83,7 @@ class TestPerHeadLMaxCompile:
                     ckpt_path,
                     output_path,
                     "--mode", "aotinductor",
-                    "--device", "cpu",
+                    "--device", "cuda",
                     "--target", "ase",
                     "--head", head_name,
                 ])
@@ -92,7 +92,7 @@ class TestPerHeadLMaxCompile:
                 # Load compiled model
                 calc = NequIPCalculator.from_compiled_model(
                     output_path,
-                    device="cpu",
+                    device="cuda",
                     chemical_species_to_atom_type_map=True,
                 )
 
