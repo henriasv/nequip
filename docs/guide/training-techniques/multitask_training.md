@@ -201,6 +201,32 @@ Use the default linear readout (``readout_mlp_hidden_layers_depth: 0``) for mult
 Standard validation metrics (energy MAE, force MAE) are not sufficient to assess whether an energy-only head will produce physically meaningful forces for molecular dynamics. A model with better validation metrics can produce catastrophically wrong MD trajectories (e.g. wrong density or structural collapse). Always validate delta-learning models with short NPT simulations before production use.
 ```
 
+#### Per-head l_max
+
+A more direct way to constrain force quality for energy-only heads is to restrict which angular momentum features they can use in the final interaction layer. Higher-l equivariant features give the readout more degrees of freedom to redistribute energy among atoms, worsening autograd forces for energy-only heads.
+
+``per_head_l_max`` replaces the last ConvNetLayer with a per-head version where each head uses only tensor product paths with input angular momentum ``l <= per_head_l_max[head_name]``. All heads share the same edge MLP weights; heads with lower l_max use a strict subset of the tensor product paths (and weights) of heads with higher l_max.
+
+```yaml
+model:
+  _target_: nequip.model.NequIPGNNModel
+  l_max: 2
+  num_layers: 4
+  head_names: [dft, rpa]
+  per_head_l_max:
+    dft: 2    # full l_max (default if omitted)
+    rpa: 0    # scalar TP paths only — constrains per-atom decomposition
+  # ... other hyperparameters ...
+```
+
+Heads without an entry in ``per_head_l_max`` default to the backbone's ``l_max``. The force-supervised head should typically use the full ``l_max`` so it can learn accurate forces, while energy-only heads benefit from a lower value (e.g. ``0``) that constrains the per-atom energy decomposition.
+
+The weight sharing means that training the force-supervised head's l=0 tensor product paths directly improves the representation used by the energy-only head.
+
+```{note}
+``per_head_l_max`` requires ``num_layers >= 2`` since the last ConvNetLayer becomes per-head while the preceding layers remain shared.
+```
+
 ### Packaging and compilation
 
 Multi-head models follow the standard [workflow](../getting-started/workflow.md) with one additional step: you select which head to compile for deployment.
