@@ -12,7 +12,7 @@ from nequip.data.transforms import (
 )
 from nequip.data.dataset import EMTTestDataset
 from nequip.model import NequIPGNNModel
-from nequip.model.extract_head import extract_head
+from nequip.model.extract_head import extract_head, extract_summed_heads, SummedHeadsConvReadout
 from nequip.nn import MultiHeadReadout
 from nequip.nn.per_head_convnetlayer import PerHeadConvNetLayer
 from nequip.utils import find_first_of_type
@@ -224,3 +224,74 @@ def test_same_l_max_same_output():
     assert full_idx == reduced_idx, (
         "Heads with same l_max should use exactly the same weight indices"
     )
+
+
+def test_extract_summed_heads_with_per_head_l_max():
+    """Summed model should equal sum of individually extracted heads."""
+    model = _build_model(per_head_l_max={"full": 2, "reduced": 0})
+    data = _make_data(head_index=0)
+
+    head_full = extract_head(model, "full")
+    head_reduced = extract_head(model, "reduced")
+    summed = extract_summed_heads(model, ["full", "reduced"])
+
+    del data[AtomicDataDict.HEAD_KEY]
+    out_full = head_full(data.copy())
+    out_reduced = head_reduced(data.copy())
+    out_summed = summed(data.copy())
+
+    expected_energy = (
+        out_full[AtomicDataDict.TOTAL_ENERGY_KEY]
+        + out_reduced[AtomicDataDict.TOTAL_ENERGY_KEY]
+    )
+    torch.testing.assert_close(
+        out_summed[AtomicDataDict.TOTAL_ENERGY_KEY],
+        expected_energy,
+    )
+
+    expected_forces = (
+        out_full[AtomicDataDict.FORCE_KEY]
+        + out_reduced[AtomicDataDict.FORCE_KEY]
+    )
+    torch.testing.assert_close(
+        out_summed[AtomicDataDict.FORCE_KEY],
+        expected_forces,
+    )
+
+
+def test_three_heads_different_l_max():
+    """Three heads with l_max=2, l_max=1, l_max=0."""
+    model = NequIPGNNModel(
+        seed=SEED,
+        model_dtype="float64",
+        type_names=TYPE_NAMES,
+        r_max=R_MAX,
+        l_max=2,
+        parity=True,
+        num_layers=3,
+        num_features=8,
+        radial_mlp_depth=1,
+        radial_mlp_width=8,
+        avg_num_neighbors=10.0,
+        head_names=["h2", "h1", "h0"],
+        per_head_l_max={"h2": 2, "h1": 1, "h0": 0},
+        per_type_energy_scales={"h2": 1.0, "h1": 1.0, "h0": 1.0},
+        per_type_energy_shifts={
+            "h2": {"Cu": 0.0, "Al": 0.0},
+            "h1": {"Cu": 0.0, "Al": 0.0},
+            "h0": {"Cu": 0.0, "Al": 0.0},
+        },
+    )
+
+    data = _make_data(head_index=0)
+    out = model(data.copy())
+    assert torch.isfinite(out[AtomicDataDict.TOTAL_ENERGY_KEY]).all()
+    assert torch.isfinite(out[AtomicDataDict.FORCE_KEY]).all()
+
+    # Weight nesting: h0 ⊂ h1 ⊂ h2
+    phc = find_first_of_type(model, PerHeadConvNetLayer)
+    h0_idx = set(getattr(phc, "_weight_indices_h0").tolist())
+    h1_idx = set(getattr(phc, "_weight_indices_h1").tolist())
+    h2_idx = set(getattr(phc, "_weight_indices_h2").tolist())
+    assert h0_idx.issubset(h1_idx)
+    assert h1_idx.issubset(h2_idx)

@@ -230,6 +230,58 @@ def extract_head(model: GraphModel, head_name: str) -> GraphModel:
     return model
 
 
+class SummedHeadsConvReadout(GraphModuleMixin, torch.nn.Module):
+    """Runs multiple heads' full pipelines (conv → readout → scale_shift) and sums.
+
+    Used when extracting summed heads from a model with ``PerHeadConvNetLayer``.
+    Each head has its own ``SingleHeadConv`` + ``ScalarMLP`` + ``PerTypeScaleShift``.
+    """
+
+    def __init__(self, head_pipelines: list):
+        """Args:
+            head_pipelines: list of ``(single_head_conv, readout, scale_shift)`` tuples.
+        """
+        super().__init__()
+        self.head_convs = torch.nn.ModuleList([c for c, _, _ in head_pipelines])
+        self.head_readouts = torch.nn.ModuleList([r for _, r, _ in head_pipelines])
+        self.head_scale_shifts = torch.nn.ModuleList(
+            [s for _, _, s in head_pipelines]
+        )
+        # Output irreps: PER_ATOM_ENERGY_KEY from scale_shift
+        # We explicitly set irreps_out to avoid inheriting NODE_FEATURES_KEY
+        # from the conv's irreps_in (which has full backbone irreps)
+        self._init_irreps(
+            irreps_in=head_pipelines[0][0].irreps_in,
+            irreps_out=head_pipelines[0][2].irreps_out,
+        )
+        # Override NODE_FEATURES_KEY in irreps_out to match the conv output (scalars)
+        from e3nn.o3 import Irreps
+
+        self.irreps_out[AtomicDataDict.NODE_FEATURES_KEY] = (
+            head_pipelines[0][0].irreps_out[AtomicDataDict.NODE_FEATURES_KEY]
+        )
+
+    def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
+        total = None
+        for conv, readout, scale_shift in zip(
+            self.head_convs, self.head_readouts, self.head_scale_shifts
+        ):
+            head_data = {k: v for k, v in data.items()}
+            head_data = conv(head_data)
+            head_data = readout(head_data)
+            head_data = scale_shift(head_data)
+            e = head_data[AtomicDataDict.PER_ATOM_ENERGY_KEY]
+            total = e if total is None else total + e
+
+        data[AtomicDataDict.PER_ATOM_ENERGY_KEY] = total
+        # Update NODE_FEATURES_KEY to match the conv output dimensions
+        # (the last SingleHeadConv already set it, but we need it consistent)
+        data[AtomicDataDict.NODE_FEATURES_KEY] = head_data[
+            AtomicDataDict.NODE_FEATURES_KEY
+        ]
+        return data
+
+
 class SummedHeadsReadout(GraphModuleMixin, torch.nn.Module):
     """Runs multiple heads' readout+scale_shift pipelines and sums per-atom energies.
 
@@ -368,20 +420,43 @@ def extract_summed_heads(model: GraphModel, head_names: list) -> GraphModel:
         out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
     )
 
-    # Replace MultiHeadReadout (and PerHeadConvNetLayer if present)
-    new_modules = {}
+    # Check for PerHeadConvNetLayer — needs special handling
+    per_head_conv = None
+    per_head_conv_key = None
     for name, child in seq_net.named_children():
         if _is_instance_by_name(child, PerHeadConvNetLayer):
-            raise NotImplementedError(
-                "extract_summed_heads does not yet support models with "
-                "per_head_l_max (PerHeadConvNetLayer). Use extract_head for "
-                "each head individually instead."
-            )
-        elif name == multihead_key:
-            new_modules["summed_heads_readout"] = summed
-            new_modules["total_energy_sum"] = reduce
-        else:
-            new_modules[name] = child
+            per_head_conv = child
+            per_head_conv_key = name
+            break
+
+    # Replace MultiHeadReadout (and PerHeadConvNetLayer if present)
+    new_modules = {}
+    if per_head_conv is not None:
+        # Build combined conv+readout pipeline per head, then sum
+        head_pipelines = []
+        for hn in head_names:
+            conv = SingleHeadConv(per_head_conv, hn)
+            readout = mhr.heads[hn]["readout"]
+            scale_shift = mhr.heads[hn]["scale_shift"]
+            head_pipelines.append((conv, readout, scale_shift))
+
+        summed_conv_readout = SummedHeadsConvReadout(head_pipelines)
+
+        for name, child in seq_net.named_children():
+            if name == per_head_conv_key:
+                continue  # skip PerHeadConvNetLayer
+            elif name == multihead_key:
+                new_modules["summed_heads_readout"] = summed_conv_readout
+                new_modules["total_energy_sum"] = reduce
+            else:
+                new_modules[name] = child
+    else:
+        for name, child in seq_net.named_children():
+            if name == multihead_key:
+                new_modules["summed_heads_readout"] = summed
+                new_modules["total_energy_sum"] = reduce
+            else:
+                new_modules[name] = child
 
     new_seq = SequentialGraphNetwork(new_modules)
 
