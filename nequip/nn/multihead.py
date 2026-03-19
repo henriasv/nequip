@@ -133,6 +133,10 @@ class MultiHeadReadout(GraphModuleMixin, torch.nn.Module):
             head_modules = self.heads[head_name]
             # Make a copy of data so each head operates independently
             head_data = data.copy()
+            # If PerHeadConvNetLayer provided per-head features, use them
+            per_head_key = f"_per_head_features_{head_name}"
+            if per_head_key in data:
+                head_data[AtomicDataDict.NODE_FEATURES_KEY] = data[per_head_key]
             head_data = head_modules["readout"](head_data)
             head_data = head_modules["scale_shift"](head_data)
             head_outputs.append(head_data[AtomicDataDict.PER_ATOM_ENERGY_KEY])

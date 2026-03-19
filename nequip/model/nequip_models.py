@@ -126,6 +126,7 @@ def NequIPGNNModel(
     radial_mlp_width: int = 128,
     # multi-head params
     head_names: Optional[List[str]] = None,
+    per_head_l_max: Optional[Dict[str, int]] = None,
     **kwargs,
 ) -> GraphModel:
     """NequIP GNN model that can predict energies only or energies with forces/stresses.
@@ -156,11 +157,20 @@ def NequIPGNNModel(
         per_type_energy_shifts_trainable (bool): whether the per-atom energy shifts are trainable (default ``False``)
         pair_potential (torch.nn.Module): additional pair potential term, e.g. :class:`~nequip.nn.pair_potential.ZBL` (default ``None``)
         do_derivatives (bool): whether to compute forces and stresses via autograd (default ``True``)
+        per_head_l_max (Dict[str, int]): per-head maximum angular momentum for the final ConvNetLayer (default ``None``). When set, each head uses only TP paths with input l <= its l_max. Requires ``head_names`` to be set.
     """
     # === sanity checks and warnings ===
     assert num_layers > 0, (
         f"at least one convnet layer required, but found `num_layers={num_layers}`"
     )
+    if per_head_l_max is not None:
+        assert head_names is not None, (
+            "`per_head_l_max` requires `head_names` to be set"
+        )
+        for hn, hl in per_head_l_max.items():
+            assert hl <= l_max, (
+                f"per_head_l_max['{hn}'] = {hl} exceeds backbone l_max = {l_max}"
+            )
 
     # === spherical harmonics ===
     irreps_edge_sh = repr(o3.Irreps.spherical_harmonics(lmax=l_max))
@@ -192,12 +202,20 @@ def NequIPGNNModel(
             ]
         )
     )
-    feature_irreps_hidden_list = [feature_irreps_hidden] * (num_layers - 1)
-    radial_mlp_depth_list = [radial_mlp_depth] * num_layers
-    radial_mlp_width_list = [radial_mlp_width] * num_layers
 
-    # === post convnets ===
-    feature_irreps_hidden_list += [repr(o3.Irreps([(num_features[0], (0, 1))]))]
+    if per_head_l_max is not None:
+        # With per-head l_max, the last ConvNetLayer is replaced by
+        # PerHeadConvNetLayer, so we need N-1 shared layers (all full irreps)
+        # and the radial MLP lists also have N-1 entries for shared layers.
+        feature_irreps_hidden_list = [feature_irreps_hidden] * (num_layers - 1)
+        radial_mlp_depth_list = [radial_mlp_depth] * (num_layers - 1)
+        radial_mlp_width_list = [radial_mlp_width] * (num_layers - 1)
+    else:
+        feature_irreps_hidden_list = [feature_irreps_hidden] * (num_layers - 1)
+        radial_mlp_depth_list = [radial_mlp_depth] * num_layers
+        radial_mlp_width_list = [radial_mlp_width] * num_layers
+        # === post convnets ===
+        feature_irreps_hidden_list += [repr(o3.Irreps([(num_features[0], (0, 1))]))]
 
     # === build model ===
     model = FullNequIPGNNModel(
@@ -207,6 +225,9 @@ def NequIPGNNModel(
         radial_mlp_depth=radial_mlp_depth_list,
         radial_mlp_width=radial_mlp_width_list,
         head_names=head_names,
+        per_head_l_max=per_head_l_max,
+        per_head_conv_radial_mlp_depth=radial_mlp_depth,
+        per_head_conv_radial_mlp_width=radial_mlp_width,
         **kwargs,
     )
     return model
@@ -246,6 +267,9 @@ def FullNequIPGNNModel(
     pair_potential: Optional[Dict] = None,
     # multi-head params
     head_names: Optional[List[str]] = None,
+    per_head_l_max: Optional[Dict[str, int]] = None,
+    per_head_conv_radial_mlp_depth: Optional[int] = None,
+    per_head_conv_radial_mlp_width: Optional[int] = None,
     # derivatives
     do_derivatives: bool = True,
     # developmental params
@@ -278,10 +302,13 @@ def FullNequIPGNNModel(
     )
     num_layers = len(radial_mlp_depth)
 
-    # assert that last convnet produces only scalars
-    assert all([l == 0 for l in o3.Irreps(feature_irreps_hidden[-1]).ls]), (
-        f"last convnet layer output must only contain scalars but found {feature_irreps_hidden[-1]}"
-    )
+    # assert that last convnet produces only scalars (unless per_head_l_max
+    # is set, in which case the shared layers output full irreps and the
+    # PerHeadConvNetLayer handles the scalar contraction per head)
+    if per_head_l_max is None:
+        assert all([l == 0 for l in o3.Irreps(feature_irreps_hidden[-1]).ls]), (
+            f"last convnet layer output must only contain scalars but found {feature_irreps_hidden[-1]}"
+        )
 
     if per_type_energy_scales is None:
         warnings.warn(
@@ -379,6 +406,36 @@ def FullNequIPGNNModel(
             per_head_scales = {name: per_head_scales["all"] for name in head_names}
         if isinstance(per_head_shifts, dict) and "all" in per_head_shifts:
             per_head_shifts = {name: per_head_shifts["all"] for name in head_names}
+
+        # === per-head l_max: insert PerHeadConvNetLayer before readout ===
+        if per_head_l_max is not None:
+            from nequip.nn.per_head_convnetlayer import PerHeadConvNetLayer
+
+            # Default unspecified heads to backbone l_max
+            full_per_head_l_max = {}
+            backbone_l_max = max(
+                ir.l
+                for _, ir in o3.Irreps(
+                    prev_irreps_out[AtomicDataDict.NODE_FEATURES_KEY]
+                )
+            )
+            for hn in head_names:
+                full_per_head_l_max[hn] = per_head_l_max.get(hn, backbone_l_max)
+
+            per_head_conv = PerHeadConvNetLayer(
+                irreps_in=prev_irreps_out,
+                head_names=head_names,
+                per_head_l_max=full_per_head_l_max,
+                radial_mlp_depth=per_head_conv_radial_mlp_depth or 1,
+                radial_mlp_width=per_head_conv_radial_mlp_width or 128,
+                use_sc=convnet_sc,
+                is_first_layer=False,
+                avg_num_neighbors=avg_num_neighbors,
+                type_names=type_names,
+                nonlinearity_scalars=convnet_nonlinearity_scalars,
+            )
+            modules.update({"per_head_conv": per_head_conv})
+            prev_irreps_out = per_head_conv.irreps_out
 
         multihead_readout = MultiHeadReadout(
             head_names=head_names,

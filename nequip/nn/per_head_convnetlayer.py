@@ -350,11 +350,12 @@ class PerHeadConvNetLayer(GraphModuleMixin, torch.nn.Module):
 
         return torch.tensor(indices, dtype=torch.long)
 
-    def forward(self, data: AtomicDataDict.Type) -> dict:
+    def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         """Run per-head convolution.
 
-        Returns a dict mapping head_name → per-atom scalar features tensor.
-        The input data dict is NOT modified (each head operates on copies).
+        Stores per-head scalar features in ``data`` under keys
+        ``_per_head_features_{head_name}`` for downstream use by
+        ``MultiHeadReadout``. Returns the modified data dict.
         """
         if AtomicDataDict.LMP_MLIAP_DATA_KEY in data:
             num_local_nodes = data[AtomicDataDict.LMP_MLIAP_DATA_KEY].nlocal
@@ -424,6 +425,6 @@ class PerHeadConvNetLayer(GraphModuleMixin, torch.nn.Module):
             if head_name in sc_inputs:
                 head_x = head_x + sc_inputs[head_name]
 
-            head_outputs[head_name] = head_x
+            data[f"_per_head_features_{head_name}"] = head_x
 
-        return head_outputs
+        return data
