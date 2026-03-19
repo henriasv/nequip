@@ -12,6 +12,7 @@ from nequip.nn import (
     MultiHeadReadout,
 )
 from nequip.nn._graph_mixin import GraphModuleMixin
+from nequip.nn.per_head_convnetlayer import PerHeadConvNetLayer
 
 
 def _is_instance_by_name(obj, cls):
@@ -19,6 +20,86 @@ def _is_instance_by_name(obj, cls):
     if isinstance(obj, cls):
         return True
     return type(obj).__name__ == cls.__name__ and hasattr(obj, "__module__")
+
+
+class SingleHeadConv(GraphModuleMixin, torch.nn.Module):
+    """Wraps a single head's components from a PerHeadConvNetLayer for deployment.
+
+    Runs the shared preprocessing (linear_1, normalization) and the specified
+    head's TP + scatter + linear_2 + activation, writing the result to
+    ``NODE_FEATURES_KEY``.
+    """
+
+    def __init__(self, per_head_conv: PerHeadConvNetLayer, head_name: str):
+        super().__init__()
+        self.head_name = head_name
+        # Shared components
+        self.linear_1 = per_head_conv.linear_1
+        self.avg_num_neighbors_norm = per_head_conv.avg_num_neighbors_norm
+        self.ghost_exchange = per_head_conv.ghost_exchange
+        self.edge_mlp = per_head_conv.edge_mlp
+        self.is_first_layer = per_head_conv.is_first_layer
+        self._activation = per_head_conv._activation
+        # Per-head components
+        self.head_modules = per_head_conv.heads[head_name]
+        self.register_buffer(
+            "_weight_indices",
+            getattr(per_head_conv, f"_weight_indices_{head_name}").clone(),
+        )
+        self._init_irreps(
+            irreps_in=per_head_conv.irreps_in,
+            irreps_out=per_head_conv.irreps_out,
+        )
+
+    def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
+        if AtomicDataDict.LMP_MLIAP_DATA_KEY in data:
+            num_local_nodes = data[AtomicDataDict.LMP_MLIAP_DATA_KEY].nlocal
+        else:
+            num_local_nodes = AtomicDataDict.num_nodes(data)
+
+        x = data[AtomicDataDict.NODE_FEATURES_KEY]
+        if not self.is_first_layer:
+            x = x[:num_local_nodes]
+
+        # Self-connection
+        sc = None
+        if "sc" in self.head_modules:
+            node_attrs = data[AtomicDataDict.NODE_ATTRS_KEY]
+            if not self.is_first_layer:
+                node_attrs = node_attrs[:num_local_nodes]
+            sc = self.head_modules["sc"](x, node_attrs)
+
+        x = self.linear_1(x)
+
+        data_copy = data.copy()
+        data_copy[AtomicDataDict.NODE_FEATURES_KEY] = x
+        data_copy = self.avg_num_neighbors_norm(data_copy)
+        x = data_copy[AtomicDataDict.NODE_FEATURES_KEY]
+
+        if not self.is_first_layer:
+            data_copy[AtomicDataDict.NODE_FEATURES_KEY] = x
+            data_copy = self.ghost_exchange(data_copy, ghost_included=False)
+            x = data_copy[AtomicDataDict.NODE_FEATURES_KEY]
+
+        edge_weights = self.edge_mlp(data[AtomicDataDict.EDGE_EMBEDDING_KEY])
+        head_weights = edge_weights[:, self._weight_indices]
+
+        x = self.head_modules["tp_scatter"](
+            x=x,
+            edge_attr=data[AtomicDataDict.EDGE_ATTRS_KEY],
+            edge_weight=head_weights,
+            edge_dst=data[AtomicDataDict.EDGE_INDEX_KEY][0],
+            edge_src=data[AtomicDataDict.EDGE_INDEX_KEY][1],
+        )[:num_local_nodes]
+
+        x = self.head_modules["linear_2"](x)
+        x = self._activation(x)
+
+        if sc is not None:
+            x = x + sc
+
+        data[AtomicDataDict.NODE_FEATURES_KEY] = x
+        return data
 
 
 def extract_head(model: GraphModel, head_name: str) -> GraphModel:
@@ -109,11 +190,14 @@ def extract_head(model: GraphModel, head_name: str) -> GraphModel:
         out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
     )
 
-    # Replace: remove multihead_readout, insert individual modules
-    # We need to rebuild the OrderedDict of the SequentialGraphNetwork
+    # Replace: remove multihead_readout (and per_head_conv if present),
+    # insert individual modules
     new_modules = {}
     for name, child in seq_net.named_children():
-        if name == multihead_key:
+        if _is_instance_by_name(child, PerHeadConvNetLayer):
+            # Replace PerHeadConvNetLayer with single-head version
+            new_modules["final_conv"] = SingleHeadConv(child, head_name)
+        elif name == multihead_key:
             # Replace with individual head modules
             new_modules["per_atom_energy_readout"] = readout
             new_modules["per_type_energy_scale_shift"] = scale_shift
@@ -284,10 +368,16 @@ def extract_summed_heads(model: GraphModel, head_names: list) -> GraphModel:
         out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
     )
 
-    # Replace MultiHeadReadout in the SequentialGraphNetwork
+    # Replace MultiHeadReadout (and PerHeadConvNetLayer if present)
     new_modules = {}
     for name, child in seq_net.named_children():
-        if name == multihead_key:
+        if _is_instance_by_name(child, PerHeadConvNetLayer):
+            raise NotImplementedError(
+                "extract_summed_heads does not yet support models with "
+                "per_head_l_max (PerHeadConvNetLayer). Use extract_head for "
+                "each head individually instead."
+            )
+        elif name == multihead_key:
             new_modules["summed_heads_readout"] = summed
             new_modules["total_energy_sum"] = reduce
         else:
