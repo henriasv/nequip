@@ -247,10 +247,34 @@ class ForceStressOutput(GraphModuleMixin, torch.nn.Module):
             # Compute per-head forces for shared_data_groups optimization.
             # These are computed inside ForceStressOutput (not in training_step)
             # so that torch.compile preserves the autograd connections.
+            # _force_heads: optional set of head names that need forces.
+            # If not set, compute forces for all heads.
+            force_heads = getattr(self, "_force_heads", None)
             if per_head_energy_keys:
-                displacement = data.get("_displacement_ref", data.get("_displacement"))
+                # Find which head was selected (to reuse its already-computed forces)
+                selected_head_key = None
+                if AtomicDataDict.HEAD_KEY in data:
+                    head_idx = data[AtomicDataDict.HEAD_KEY].view(-1)[0].item()
+                    for key in per_head_energy_keys:
+                        hn = key[len("_total_energy_"):]
+                        # Match by checking if this head's energy equals selected total_energy
+                        # (cheaper than looking up head names by index)
+                        if torch.equal(data[key], data[AtomicDataDict.TOTAL_ENERGY_KEY]):
+                            selected_head_key = key
+                            break
+
                 for i, key in enumerate(per_head_energy_keys):
                     head_name = key[len("_total_energy_"):]
+
+                    # Skip if this head doesn't need forces
+                    if force_heads is not None and head_name not in force_heads:
+                        continue
+
+                    # Reuse already-computed forces for the selected head
+                    if key == selected_head_key:
+                        data[f"_forces_{head_name}"] = forces
+                        continue
+
                     is_last = i == len(per_head_energy_keys) - 1
                     h_grads = torch.autograd.grad(
                         [data[key].sum()],

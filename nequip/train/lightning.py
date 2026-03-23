@@ -70,6 +70,7 @@ class NequIPLightningModule(lightning.LightningModule):
         # multi-head training
         per_head_loss_weights: Optional[Dict[str, float]] = None,
         shared_data_groups: Optional[Dict[str, List[int]]] = None,
+        force_head_indices: Optional[List[int]] = None,
     ):
         super().__init__()
 
@@ -141,6 +142,24 @@ class NequIPLightningModule(lightning.LightningModule):
         # Format: {"0": [0, 2], "2": [3, 4]}
         # Dataloaders not listed default to single head with same index.
         self.shared_data_groups = shared_data_groups
+
+        # multi-head: which heads need force computation (optimization).
+        # Heads not listed skip autograd.grad in ForceStressOutput, saving
+        # ~8ms per skipped head. Default (None): compute forces for all heads.
+        self.force_head_indices = force_head_indices
+        # Set _force_heads on the ForceStressOutput after model build
+        if force_head_indices is not None:
+            from nequip.nn import MultiHeadReadout, ForceStressOutput
+            from nequip.utils import find_first_of_type
+
+            for model_key in self.model:
+                mhr = find_first_of_type(self.model[model_key], MultiHeadReadout)
+                fso = find_first_of_type(self.model[model_key], ForceStressOutput)
+                if mhr is not None and fso is not None:
+                    force_head_names = {
+                        mhr.head_names[i] for i in force_head_indices
+                    }
+                    fso._force_heads = force_head_names
 
         # == DDP concerns for loss ==
 
@@ -368,14 +387,26 @@ class NequIPLightningModule(lightning.LightningModule):
                         head_name = mhr.head_names[head_idx]
 
                         # Use pre-computed per-head total energy and forces
-                        # (computed inside ForceStressOutput)
+                        # (computed inside ForceStressOutput).
+                        # If forces weren't computed for this head (energy-only),
+                        # use NaN forces so ignore_nan in the loss handles it.
                         head_output = output.copy()
                         head_output[AtomicDataDict.TOTAL_ENERGY_KEY] = (
                             output[f"_total_energy_{head_name}"]
                         )
-                        head_output[AtomicDataDict.FORCE_KEY] = (
-                            output[f"_forces_{head_name}"]
-                        )
+                        forces_key = f"_forces_{head_name}"
+                        if forces_key in output:
+                            head_output[AtomicDataDict.FORCE_KEY] = (
+                                output[forces_key]
+                            )
+                        else:
+                            # Energy-only head: set NaN forces for ignore_nan
+                            head_output[AtomicDataDict.FORCE_KEY] = (
+                                torch.full_like(
+                                    output[AtomicDataDict.FORCE_KEY],
+                                    float("nan"),
+                                )
+                            )
 
                         total_loss = total_loss + self._compute_head_loss(
                             head_output,
