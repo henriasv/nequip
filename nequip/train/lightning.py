@@ -69,8 +69,8 @@ class NequIPLightningModule(lightning.LightningModule):
         info_dict: Optional[Dict] = None,
         # multi-head training
         per_head_loss_weights: Optional[Dict[str, float]] = None,
+        train_metrics_every_n_steps: int = 1,
         shared_data_groups: Optional[Dict[str, List[int]]] = None,
-        force_head_indices: Optional[List[int]] = None,
     ):
         super().__init__()
 
@@ -141,25 +141,8 @@ class NequIPLightningModule(lightning.LightningModule):
         # Maps dataloader key → list of head indices that share this data source.
         # Format: {"0": [0, 2], "2": [3, 4]}
         # Dataloaders not listed default to single head with same index.
+        self.train_metrics_every_n_steps = train_metrics_every_n_steps
         self.shared_data_groups = shared_data_groups
-
-        # multi-head: which heads need force computation (optimization).
-        # Heads not listed skip autograd.grad in ForceStressOutput, saving
-        # ~8ms per skipped head. Default (None): compute forces for all heads.
-        self.force_head_indices = force_head_indices
-        # Set _force_heads on the ForceStressOutput after model build
-        if force_head_indices is not None:
-            from nequip.nn import MultiHeadReadout, ForceStressOutput
-            from nequip.utils import find_first_of_type
-
-            for model_key in self.model:
-                mhr = find_first_of_type(self.model[model_key], MultiHeadReadout)
-                fso = find_first_of_type(self.model[model_key], ForceStressOutput)
-                if mhr is not None and fso is not None:
-                    force_head_names = {
-                        mhr.head_names[i] for i in force_head_indices
-                    }
-                    fso._force_heads = force_head_names
 
         # == DDP concerns for loss ==
 
@@ -279,35 +262,23 @@ class NequIPLightningModule(lightning.LightningModule):
 
     def _compute_head_loss(
         self, output, target, head_key, batch_idx, dataloader_idx,
-        log_accumulator=None,
     ):
-        """Compute loss and metrics for a single head. Returns the (weighted) loss.
-
-        If ``log_accumulator`` is provided (a dict), log entries are accumulated
-        into it instead of calling ``self.log_dict`` immediately. The caller
-        should call ``self.log_dict(log_accumulator)`` once after all heads.
-        """
-        if self.train_metrics is not None:
+        """Compute loss and metrics for a single head. Returns the (weighted) loss."""
+        if self.train_metrics is not None and self.global_step % self.train_metrics_every_n_steps == 0:
             with torch.no_grad():
                 train_metric_dict = self.train_metrics(
                     output,
                     target,
                     prefix=f"train_metric_step_head{head_key}{self.logging_delimiter}",
                 )
-            if log_accumulator is not None:
-                log_accumulator.update(train_metric_dict)
-            else:
-                self.log_dict(train_metric_dict)
+            self.log_dict(train_metric_dict)
 
         loss_dict = self.loss(
             output,
             target,
             prefix=f"train_loss_step_head{head_key}{self.logging_delimiter}",
         )
-        if log_accumulator is not None:
-            log_accumulator.update(loss_dict)
-        else:
-            self.log_dict(loss_dict)
+        self.log_dict(loss_dict)
 
         head_loss = loss_dict[
             f"train_loss_step_head{head_key}{self.logging_delimiter}weighted_sum"
@@ -326,7 +297,6 @@ class NequIPLightningModule(lightning.LightningModule):
         if isinstance(batch, dict) and self.num_datasets["train"] > 1:
             # Multi-head: CombinedLoader gives dict of batches keyed by str(index)
             total_loss = 0.0
-            log_accum = {}  # batch all log_dict calls into one
 
             # Build dataloader_key → head_indices mapping
             # shared_data_groups: {"0": [0, 2], "2": [3, 4]}
@@ -360,7 +330,6 @@ class NequIPLightningModule(lightning.LightningModule):
                     output = self(base_batch)
                     total_loss = total_loss + self._compute_head_loss(
                         output, target, head_key, batch_idx, dataloader_idx,
-                        log_accumulator=log_accum,
                     )
                 else:
                     # Multiple heads share this dataloader — single forward
@@ -414,12 +383,9 @@ class NequIPLightningModule(lightning.LightningModule):
                             head_key,
                             batch_idx,
                             dataloader_idx,
-                            log_accumulator=log_accum,
-                        )
+                            )
 
             # Single batched log call instead of per-head calls
-            if log_accum:
-                self.log_dict(log_accum)
             return total_loss * self.world_size
         else:
             # Single-head: original path
@@ -427,7 +393,7 @@ class NequIPLightningModule(lightning.LightningModule):
             output = self(batch)
 
             # optionally compute training metrics
-            if self.train_metrics is not None:
+            if self.train_metrics is not None and self.global_step % self.train_metrics_every_n_steps == 0:
                 with torch.no_grad():
                     train_metric_dict = self.train_metrics(
                         output, target, prefix=f"train_metric_step{self.logging_delimiter}"

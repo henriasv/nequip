@@ -309,9 +309,7 @@ class MetricsManager(torch.nn.ModuleDict):
                 metric = self[metric_name](preds, target)
 
             metric_dict.update({prefix + metric_name + suffix: metric})
-            # Store detached tensor instead of .item() to avoid GPU sync per metric.
-            # Consumers that need Python floats should call .item() themselves.
-            self.metrics_values_step.update({metric_name: metric.detach()})
+            self.metrics_values_step.update({metric_name: metric.item()})
 
             if self.do_weighted_sum:
                 coeff: Optional[float] = metric_params["coeff"]
@@ -390,10 +388,7 @@ class MetricsManager(torch.nn.ModuleDict):
         """"""
         return {
             "coeff_dict": {k: v["coeff"] for k, v in self.metrics.items()},
-            "metrics_values_step": {
-                k: v.item() if isinstance(v, torch.Tensor) else v
-                for k, v in self.metrics_values_step.items()
-            },
+            "metrics_values_step": self.metrics_values_step,
             "metrics_values_epoch": self.metrics_values_epoch,
         }
 

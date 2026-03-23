@@ -249,15 +249,9 @@ class ForceStressOutput(GraphModuleMixin, torch.nn.Module):
             # so that torch.compile preserves the autograd connections.
             # _force_heads: optional set of head names that need forces.
             # If not set, compute forces for all heads.
-            force_heads = getattr(self, "_force_heads", None)
             if per_head_energy_keys:
                 for i, key in enumerate(per_head_energy_keys):
                     head_name = key[len("_total_energy_"):]
-
-                    # Skip if this head doesn't need forces
-                    if force_heads is not None and head_name not in force_heads:
-                        continue
-
                     is_last = i == len(per_head_energy_keys) - 1
                     h_grads = torch.autograd.grad(
                         [data[key].sum()],
