@@ -151,4 +151,8 @@ class MultiHeadReadout(GraphModuleMixin, torch.nn.Module):
         # Reduce to total energy
         data = self.reduce(data)
 
+        # Clean up internal per-head feature keys
+        for head_name in self.head_names:
+            data.pop(f"_per_head_features_{head_name}", None)
+
         return data

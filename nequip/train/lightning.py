@@ -69,6 +69,7 @@ class NequIPLightningModule(lightning.LightningModule):
         info_dict: Optional[Dict] = None,
         # multi-head training
         per_head_loss_weights: Optional[Dict[str, float]] = None,
+        shared_data_groups: Optional[List[List[int]]] = None,
     ):
         super().__init__()
 
@@ -134,6 +135,16 @@ class NequIPLightningModule(lightning.LightningModule):
 
         # multi-head: per-head loss weights (defaults to uniform)
         self.per_head_loss_weights = per_head_loss_weights
+
+        # multi-head: shared data groups for batching optimization
+        self.shared_data_groups = shared_data_groups
+        if shared_data_groups is not None:
+            self._grouped_heads = set()
+            for group in shared_data_groups:
+                for h in group:
+                    self._grouped_heads.add(str(h))
+        else:
+            self._grouped_heads = set()
 
         # == DDP concerns for loss ==
 
@@ -251,6 +262,36 @@ class NequIPLightningModule(lightning.LightningModule):
         # subclasses can override this function
         return batch.copy()
 
+    def _compute_head_loss(
+        self, output, target, head_key, batch_idx, dataloader_idx
+    ):
+        """Compute loss and metrics for a single head. Returns the (weighted) loss."""
+        if self.train_metrics is not None:
+            with torch.no_grad():
+                train_metric_dict = self.train_metrics(
+                    output,
+                    target,
+                    prefix=f"train_metric_step_head{head_key}{self.logging_delimiter}",
+                )
+            self.log_dict(train_metric_dict)
+
+        loss_dict = self.loss(
+            output,
+            target,
+            prefix=f"train_loss_step_head{head_key}{self.logging_delimiter}",
+        )
+        self.log_dict(loss_dict)
+
+        head_loss = loss_dict[
+            f"train_loss_step_head{head_key}{self.logging_delimiter}weighted_sum"
+        ]
+
+        if self.per_head_loss_weights is not None:
+            weight = self.per_head_loss_weights.get(head_key, 1.0)
+            head_loss = head_loss * weight
+
+        return head_loss
+
     def training_step(
         self, batch, batch_idx: int, dataloader_idx: int = 0
     ):
@@ -258,38 +299,84 @@ class NequIPLightningModule(lightning.LightningModule):
         if isinstance(batch, dict) and self.num_datasets["train"] > 1:
             # Multi-head: CombinedLoader gives dict of batches keyed by str(index)
             total_loss = 0.0
-            for head_key, head_batch in batch.items():
-                target = self.process_target(head_batch, batch_idx, dataloader_idx)
-                output = self(head_batch)
+            processed_heads = set()
 
-                # optionally compute training metrics (per-head prefixed)
-                if self.train_metrics is not None:
-                    with torch.no_grad():
-                        train_metric_dict = self.train_metrics(
-                            output,
-                            target,
-                            prefix=f"train_metric_step_head{head_key}{self.logging_delimiter}",
+            # Process shared-data groups: merge batches with different HEAD_KEY
+            # stamps and run a single forward pass per group
+            if self.shared_data_groups is not None:
+                for group in self.shared_data_groups:
+                    primary_key = str(group[0])
+                    if primary_key not in batch:
+                        continue
+                    base_batch = batch[primary_key]
+
+                    # Merge batch with mixed head stamps
+                    sub_batches = []
+                    for head_idx in group:
+                        b = {
+                            k: v.clone() if isinstance(v, torch.Tensor) else v
+                            for k, v in base_batch.items()
+                        }
+                        b[AtomicDataDict.HEAD_KEY] = torch.full_like(
+                            base_batch[AtomicDataDict.HEAD_KEY], head_idx
                         )
-                    self.log_dict(train_metric_dict)
+                        sub_batches.append(b)
+                    merged = AtomicDataDict.batched_from_list(sub_batches)
+                    merged_target = self.process_target(
+                        merged, batch_idx, dataloader_idx
+                    )
 
-                # compute loss
-                loss_dict = self.loss(
-                    output,
-                    target,
-                    prefix=f"train_loss_step_head{head_key}{self.logging_delimiter}",
+                    # Single forward pass for the whole group
+                    merged_output = self(merged)
+
+                    # Split by head for per-head loss/metrics
+                    n_frames_per_head = AtomicDataDict.num_frames(base_batch)
+                    for i, head_idx in enumerate(group):
+                        head_key = str(head_idx)
+                        # Extract this head's frames from the merged batch
+                        frame_indices = list(
+                            range(
+                                i * n_frames_per_head,
+                                (i + 1) * n_frames_per_head,
+                            )
+                        )
+                        head_output = AtomicDataDict.batched_from_list(
+                            [
+                                AtomicDataDict.frame_from_batched(
+                                    merged_output, fi
+                                )
+                                for fi in frame_indices
+                            ]
+                        )
+                        head_target = AtomicDataDict.batched_from_list(
+                            [
+                                AtomicDataDict.frame_from_batched(
+                                    merged_target, fi
+                                )
+                                for fi in frame_indices
+                            ]
+                        )
+
+                        total_loss = total_loss + self._compute_head_loss(
+                            head_output,
+                            head_target,
+                            head_key,
+                            batch_idx,
+                            dataloader_idx,
+                        )
+                        processed_heads.add(head_key)
+
+            # Process ungrouped heads individually
+            for head_key, head_batch in batch.items():
+                if head_key in processed_heads:
+                    continue
+                target = self.process_target(
+                    head_batch, batch_idx, dataloader_idx
                 )
-                self.log_dict(loss_dict)
-
-                head_loss = loss_dict[
-                    f"train_loss_step_head{head_key}{self.logging_delimiter}weighted_sum"
-                ]
-
-                # apply per-head loss weight
-                if self.per_head_loss_weights is not None:
-                    weight = self.per_head_loss_weights.get(head_key, 1.0)
-                    head_loss = head_loss * weight
-
-                total_loss = total_loss + head_loss
+                output = self(head_batch)
+                total_loss = total_loss + self._compute_head_loss(
+                    output, target, head_key, batch_idx, dataloader_idx
+                )
 
             return total_loss * self.world_size
         else:
