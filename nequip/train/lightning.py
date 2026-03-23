@@ -347,14 +347,13 @@ class NequIPLightningModule(lightning.LightningModule):
                     # Multiple heads share this dataloader — single forward
                     # pass computes all heads simultaneously. The backbone
                     # and PerHeadConvNetLayer run once; MultiHeadReadout
-                    # stores per-head total energies as explicit named
-                    # outputs (_total_energy_{head_name}) that survive
-                    # torch.compile pruning.
+                    # stores per-head total energies, and ForceStressOutput
+                    # computes per-head forces — all inside the model's
+                    # forward pass (compatible with torch.compile).
                     target = self.process_target(
                         base_batch, batch_idx, dataloader_idx
                     )
                     output = self(base_batch)
-                    pos = output[AtomicDataDict.POSITIONS_KEY]
 
                     # Find head names from the model's MultiHeadReadout
                     from nequip.nn import MultiHeadReadout
@@ -368,26 +367,15 @@ class NequIPLightningModule(lightning.LightningModule):
                         head_key = str(head_idx)
                         head_name = mhr.head_names[head_idx]
 
-                        # Use pre-computed per-head total energy
-                        head_total_e = output[
-                            f"_total_energy_{head_name}"
-                        ]
-
-                        # Compute forces via autograd
-                        head_forces = torch.autograd.grad(
-                            head_total_e.sum(),
-                            pos,
-                            create_graph=self.training,
-                            retain_graph=True,
-                        )[0]
-                        head_forces = torch.neg(head_forces)
-
-                        # Build output dict for loss computation
+                        # Use pre-computed per-head total energy and forces
+                        # (computed inside ForceStressOutput)
                         head_output = output.copy()
                         head_output[AtomicDataDict.TOTAL_ENERGY_KEY] = (
-                            head_total_e
+                            output[f"_total_energy_{head_name}"]
                         )
-                        head_output[AtomicDataDict.FORCE_KEY] = head_forces
+                        head_output[AtomicDataDict.FORCE_KEY] = (
+                            output[f"_forces_{head_name}"]
+                        )
 
                         total_loss = total_loss + self._compute_head_loss(
                             head_output,

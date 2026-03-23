@@ -214,10 +214,19 @@ class ForceStressOutput(GraphModuleMixin, torch.nn.Module):
             # Call model and get gradients
             data = self.func(data)
 
+            # Detect per-head total energies from MultiHeadReadout
+            # (keys like _total_energy_h0, _total_energy_h1, ...)
+            per_head_energy_keys = [
+                k for k in data if k.startswith("_total_energy_")
+            ]
+
+            # Compute forces/virial for the selected head
+            retain = bool(per_head_energy_keys) or self.training
             grads = torch.autograd.grad(
                 [data[AtomicDataDict.TOTAL_ENERGY_KEY].sum()],
                 [pos, data["_displacement"]],
-                create_graph=self.training,  # needed to allow gradients of this output during training
+                create_graph=self.training,
+                retain_graph=retain,
             )
 
             # Put negative sign on forces
@@ -234,6 +243,25 @@ class ForceStressOutput(GraphModuleMixin, torch.nn.Module):
                 # condition needed to unwrap optional for torchscript
                 assert False, "failed to compute virial autograd"
             virial = virial.view(num_batch, 3, 3)
+
+            # Compute per-head forces for shared_data_groups optimization.
+            # These are computed inside ForceStressOutput (not in training_step)
+            # so that torch.compile preserves the autograd connections.
+            if per_head_energy_keys:
+                displacement = data.get("_displacement_ref", data.get("_displacement"))
+                for i, key in enumerate(per_head_energy_keys):
+                    head_name = key[len("_total_energy_"):]
+                    is_last = i == len(per_head_energy_keys) - 1
+                    h_grads = torch.autograd.grad(
+                        [data[key].sum()],
+                        [pos],
+                        create_graph=self.training,
+                        retain_graph=not is_last or self.training,
+                    )
+                    h_forces = h_grads[0]
+                    if h_forces is None:
+                        assert False, f"failed to compute forces for head {head_name}"
+                    data[f"_forces_{head_name}"] = torch.neg(h_forces)
 
             # we only compute the stress (1/V * virial) if we have a cell whose volume we can compute
             if has_cell:
