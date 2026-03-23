@@ -69,7 +69,7 @@ class NequIPLightningModule(lightning.LightningModule):
         info_dict: Optional[Dict] = None,
         # multi-head training
         per_head_loss_weights: Optional[Dict[str, float]] = None,
-        shared_data_groups: Optional[List[List[int]]] = None,
+        shared_data_groups: Optional[Dict[str, List[int]]] = None,
     ):
         super().__init__()
 
@@ -137,14 +137,10 @@ class NequIPLightningModule(lightning.LightningModule):
         self.per_head_loss_weights = per_head_loss_weights
 
         # multi-head: shared data groups for batching optimization
+        # Maps dataloader key → list of head indices that share this data source.
+        # Format: {"0": [0, 2], "2": [3, 4]}
+        # Dataloaders not listed default to single head with same index.
         self.shared_data_groups = shared_data_groups
-        if shared_data_groups is not None:
-            self._grouped_heads = set()
-            for group in shared_data_groups:
-                for h in group:
-                    self._grouped_heads.add(str(h))
-        else:
-            self._grouped_heads = set()
 
         # == DDP concerns for loss ==
 
@@ -301,18 +297,46 @@ class NequIPLightningModule(lightning.LightningModule):
             total_loss = 0.0
             processed_heads = set()
 
-            # Process shared-data groups: merge batches with different HEAD_KEY
-            # stamps and run a single forward pass per group
+            # Build dataloader_key → head_indices mapping
+            # shared_data_groups: {"0": [0, 2], "2": [3, 4]}
+            # Default: each dataloader feeds a single head with same index
+            dl_to_heads = {}
             if self.shared_data_groups is not None:
-                for group in self.shared_data_groups:
-                    primary_key = str(group[0])
-                    if primary_key not in batch:
-                        continue
-                    base_batch = batch[primary_key]
+                for dl_key, head_indices in self.shared_data_groups.items():
+                    dl_to_heads[str(dl_key)] = head_indices
+            for dl_key in batch:
+                if dl_key not in dl_to_heads:
+                    dl_to_heads[dl_key] = [int(dl_key)]
 
-                    # Merge batch with mixed head stamps
+            for dl_key, head_indices in dl_to_heads.items():
+                if dl_key not in batch:
+                    continue
+                base_batch = batch[dl_key]
+
+                if len(head_indices) == 1:
+                    # Single head for this dataloader — no merging needed
+                    head_key = str(head_indices[0])
+                    # Stamp HEAD_KEY in case dataloader index != head index
+                    if base_batch[AtomicDataDict.HEAD_KEY][0].item() != head_indices[0]:
+                        base_batch = {
+                            k: v.clone() if isinstance(v, torch.Tensor) else v
+                            for k, v in base_batch.items()
+                        }
+                        base_batch[AtomicDataDict.HEAD_KEY] = torch.full_like(
+                            base_batch[AtomicDataDict.HEAD_KEY], head_indices[0]
+                        )
+                    target = self.process_target(
+                        base_batch, batch_idx, dataloader_idx
+                    )
+                    output = self(base_batch)
+                    total_loss = total_loss + self._compute_head_loss(
+                        output, target, head_key, batch_idx, dataloader_idx
+                    )
+                else:
+                    # Multiple heads share this dataloader — merge with
+                    # different HEAD_KEY stamps, single forward pass
                     sub_batches = []
-                    for head_idx in group:
+                    for head_idx in head_indices:
                         b = {
                             k: v.clone() if isinstance(v, torch.Tensor) else v
                             for k, v in base_batch.items()
@@ -325,20 +349,14 @@ class NequIPLightningModule(lightning.LightningModule):
                     merged_target = self.process_target(
                         merged, batch_idx, dataloader_idx
                     )
-
-                    # Single forward pass for the whole group
                     merged_output = self(merged)
 
                     # Split by head for per-head loss/metrics
-                    n_frames_per_head = AtomicDataDict.num_frames(base_batch)
-                    for i, head_idx in enumerate(group):
+                    n_frames = AtomicDataDict.num_frames(base_batch)
+                    for i, head_idx in enumerate(head_indices):
                         head_key = str(head_idx)
-                        # Extract this head's frames from the merged batch
                         frame_indices = list(
-                            range(
-                                i * n_frames_per_head,
-                                (i + 1) * n_frames_per_head,
-                            )
+                            range(i * n_frames, (i + 1) * n_frames)
                         )
                         head_output = AtomicDataDict.batched_from_list(
                             [
@@ -356,7 +374,6 @@ class NequIPLightningModule(lightning.LightningModule):
                                 for fi in frame_indices
                             ]
                         )
-
                         total_loss = total_loss + self._compute_head_loss(
                             head_output,
                             head_target,
@@ -364,19 +381,6 @@ class NequIPLightningModule(lightning.LightningModule):
                             batch_idx,
                             dataloader_idx,
                         )
-                        processed_heads.add(head_key)
-
-            # Process ungrouped heads individually
-            for head_key, head_batch in batch.items():
-                if head_key in processed_heads:
-                    continue
-                target = self.process_target(
-                    head_batch, batch_idx, dataloader_idx
-                )
-                output = self(head_batch)
-                total_loss = total_loss + self._compute_head_loss(
-                    output, target, head_key, batch_idx, dataloader_idx
-                )
 
             return total_loss * self.world_size
         else:
