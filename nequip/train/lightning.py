@@ -259,9 +259,15 @@ class NequIPLightningModule(lightning.LightningModule):
         return batch.copy()
 
     def _compute_head_loss(
-        self, output, target, head_key, batch_idx, dataloader_idx
+        self, output, target, head_key, batch_idx, dataloader_idx,
+        log_accumulator=None,
     ):
-        """Compute loss and metrics for a single head. Returns the (weighted) loss."""
+        """Compute loss and metrics for a single head. Returns the (weighted) loss.
+
+        If ``log_accumulator`` is provided (a dict), log entries are accumulated
+        into it instead of calling ``self.log_dict`` immediately. The caller
+        should call ``self.log_dict(log_accumulator)`` once after all heads.
+        """
         if self.train_metrics is not None:
             with torch.no_grad():
                 train_metric_dict = self.train_metrics(
@@ -269,14 +275,20 @@ class NequIPLightningModule(lightning.LightningModule):
                     target,
                     prefix=f"train_metric_step_head{head_key}{self.logging_delimiter}",
                 )
-            self.log_dict(train_metric_dict)
+            if log_accumulator is not None:
+                log_accumulator.update(train_metric_dict)
+            else:
+                self.log_dict(train_metric_dict)
 
         loss_dict = self.loss(
             output,
             target,
             prefix=f"train_loss_step_head{head_key}{self.logging_delimiter}",
         )
-        self.log_dict(loss_dict)
+        if log_accumulator is not None:
+            log_accumulator.update(loss_dict)
+        else:
+            self.log_dict(loss_dict)
 
         head_loss = loss_dict[
             f"train_loss_step_head{head_key}{self.logging_delimiter}weighted_sum"
@@ -295,7 +307,7 @@ class NequIPLightningModule(lightning.LightningModule):
         if isinstance(batch, dict) and self.num_datasets["train"] > 1:
             # Multi-head: CombinedLoader gives dict of batches keyed by str(index)
             total_loss = 0.0
-            processed_heads = set()
+            log_accum = {}  # batch all log_dict calls into one
 
             # Build dataloader_key → head_indices mapping
             # shared_data_groups: {"0": [0, 2], "2": [3, 4]}
@@ -318,10 +330,8 @@ class NequIPLightningModule(lightning.LightningModule):
                     head_key = str(head_indices[0])
                     # Stamp HEAD_KEY in case dataloader index != head index
                     if base_batch[AtomicDataDict.HEAD_KEY][0].item() != head_indices[0]:
-                        base_batch = {
-                            k: v.clone() if isinstance(v, torch.Tensor) else v
-                            for k, v in base_batch.items()
-                        }
+                        # Shallow copy — only HEAD_KEY needs to be new
+                        base_batch = dict(base_batch)
                         base_batch[AtomicDataDict.HEAD_KEY] = torch.full_like(
                             base_batch[AtomicDataDict.HEAD_KEY], head_indices[0]
                         )
@@ -330,7 +340,8 @@ class NequIPLightningModule(lightning.LightningModule):
                     )
                     output = self(base_batch)
                     total_loss = total_loss + self._compute_head_loss(
-                        output, target, head_key, batch_idx, dataloader_idx
+                        output, target, head_key, batch_idx, dataloader_idx,
+                        log_accumulator=log_accum,
                     )
                 else:
                     # Multiple heads share this dataloader — single forward
@@ -396,8 +407,12 @@ class NequIPLightningModule(lightning.LightningModule):
                             head_key,
                             batch_idx,
                             dataloader_idx,
+                            log_accumulator=log_accum,
                         )
 
+            # Single batched log call instead of per-head calls
+            if log_accum:
+                self.log_dict(log_accum)
             return total_loss * self.world_size
         else:
             # Single-head: original path
