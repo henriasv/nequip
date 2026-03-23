@@ -57,7 +57,7 @@ class TensorProductScatter(torch.nn.Module):
         if not _TORCH_GE_2_7:
             raise RuntimeError("OpenEquivariance requires PyTorch >= 2.7.")
 
-        _TRAIN_TIME_COMPILE: bool = model.is_compile_graph_model
+        _TRAIN_TIME_COMPILE: bool = getattr(model, "is_compile_graph_model", False)
 
         def factory(old):
             with torch_default_dtype(old.model_dtype):
