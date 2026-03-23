@@ -333,50 +333,66 @@ class NequIPLightningModule(lightning.LightningModule):
                         output, target, head_key, batch_idx, dataloader_idx
                     )
                 else:
-                    # Multiple heads share this dataloader — merge with
-                    # different HEAD_KEY stamps, single forward pass
-                    sub_batches = []
-                    for head_idx in head_indices:
-                        b = {
-                            k: v.clone() if isinstance(v, torch.Tensor) else v
-                            for k, v in base_batch.items()
-                        }
-                        b[AtomicDataDict.HEAD_KEY] = torch.full_like(
-                            base_batch[AtomicDataDict.HEAD_KEY], head_idx
-                        )
-                        sub_batches.append(b)
-                    merged = AtomicDataDict.batched_from_list(sub_batches)
-                    merged_target = self.process_target(
-                        merged, batch_idx, dataloader_idx
+                    # Multiple heads share this dataloader — single forward
+                    # pass computes all heads simultaneously. The backbone
+                    # and PerHeadConvNetLayer run once; MultiHeadReadout
+                    # stores per-head energies in _all_head_per_atom_energies.
+                    # We then extract each head's energy, compute forces via
+                    # autograd, and compute per-head losses.
+                    target = self.process_target(
+                        base_batch, batch_idx, dataloader_idx
                     )
-                    merged_output = self(merged)
+                    output = self(base_batch)
 
-                    # Split by head for per-head loss/metrics
-                    n_frames = AtomicDataDict.num_frames(base_batch)
-                    for i, head_idx in enumerate(head_indices):
+                    # Get per-head energies from stacked output
+                    all_head_e = output.get("_all_head_per_atom_energies")
+                    if all_head_e is None:
+                        raise RuntimeError(
+                            "shared_data_groups requires MultiHeadReadout "
+                            "to store _all_head_per_atom_energies"
+                        )
+                    pos = output[AtomicDataDict.POSITIONS_KEY]
+
+                    for head_idx in head_indices:
                         head_key = str(head_idx)
-                        frame_indices = list(
-                            range(i * n_frames, (i + 1) * n_frames)
+                        # Extract this head's per-atom energy
+                        head_per_atom_e = all_head_e[:, head_idx, :]
+
+                        # Sum to total energy per frame
+                        if AtomicDataDict.BATCH_KEY in output:
+                            from nequip.nn.utils import scatter
+                            head_total_e = scatter(
+                                head_per_atom_e,
+                                output[AtomicDataDict.BATCH_KEY],
+                                dim=0,
+                            )
+                        else:
+                            head_total_e = head_per_atom_e.sum(
+                                dim=0, keepdim=True
+                            )
+
+                        # Compute forces via autograd
+                        head_forces = torch.autograd.grad(
+                            head_total_e.sum(),
+                            pos,
+                            create_graph=self.training,
+                            retain_graph=True,
+                        )[0]
+                        head_forces = torch.neg(head_forces)
+
+                        # Build output dict for loss computation
+                        head_output = output.copy()
+                        head_output[AtomicDataDict.PER_ATOM_ENERGY_KEY] = (
+                            head_per_atom_e
                         )
-                        head_output = AtomicDataDict.batched_from_list(
-                            [
-                                AtomicDataDict.frame_from_batched(
-                                    merged_output, fi
-                                )
-                                for fi in frame_indices
-                            ]
+                        head_output[AtomicDataDict.TOTAL_ENERGY_KEY] = (
+                            head_total_e
                         )
-                        head_target = AtomicDataDict.batched_from_list(
-                            [
-                                AtomicDataDict.frame_from_batched(
-                                    merged_target, fi
-                                )
-                                for fi in frame_indices
-                            ]
-                        )
+                        head_output[AtomicDataDict.FORCE_KEY] = head_forces
+
                         total_loss = total_loss + self._compute_head_loss(
                             head_output,
-                            head_target,
+                            target,
                             head_key,
                             batch_idx,
                             dataloader_idx,
