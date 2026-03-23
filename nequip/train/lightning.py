@@ -347,40 +347,31 @@ class NequIPLightningModule(lightning.LightningModule):
                     # Multiple heads share this dataloader — single forward
                     # pass computes all heads simultaneously. The backbone
                     # and PerHeadConvNetLayer run once; MultiHeadReadout
-                    # stores per-head energies in _all_head_per_atom_energies.
-                    # We then extract each head's energy, compute forces via
-                    # autograd, and compute per-head losses.
+                    # stores per-head total energies as explicit named
+                    # outputs (_total_energy_{head_name}) that survive
+                    # torch.compile pruning.
                     target = self.process_target(
                         base_batch, batch_idx, dataloader_idx
                     )
                     output = self(base_batch)
-
-                    # Get per-head energies from stacked output
-                    all_head_e = output.get("_all_head_per_atom_energies")
-                    if all_head_e is None:
-                        raise RuntimeError(
-                            "shared_data_groups requires MultiHeadReadout "
-                            "to store _all_head_per_atom_energies"
-                        )
                     pos = output[AtomicDataDict.POSITIONS_KEY]
+
+                    # Find head names from the model's MultiHeadReadout
+                    from nequip.nn import MultiHeadReadout
+                    from nequip.utils import find_first_of_type
+
+                    mhr = find_first_of_type(
+                        self.model[_SOLE_MODEL_KEY], MultiHeadReadout
+                    )
 
                     for head_idx in head_indices:
                         head_key = str(head_idx)
-                        # Extract this head's per-atom energy
-                        head_per_atom_e = all_head_e[:, head_idx, :]
+                        head_name = mhr.head_names[head_idx]
 
-                        # Sum to total energy per frame
-                        if AtomicDataDict.BATCH_KEY in output:
-                            from nequip.nn.utils import scatter
-                            head_total_e = scatter(
-                                head_per_atom_e,
-                                output[AtomicDataDict.BATCH_KEY],
-                                dim=0,
-                            )
-                        else:
-                            head_total_e = head_per_atom_e.sum(
-                                dim=0, keepdim=True
-                            )
+                        # Use pre-computed per-head total energy
+                        head_total_e = output[
+                            f"_total_energy_{head_name}"
+                        ]
 
                         # Compute forces via autograd
                         head_forces = torch.autograd.grad(
@@ -393,9 +384,6 @@ class NequIPLightningModule(lightning.LightningModule):
 
                         # Build output dict for loss computation
                         head_output = output.copy()
-                        head_output[AtomicDataDict.PER_ATOM_ENERGY_KEY] = (
-                            head_per_atom_e
-                        )
                         head_output[AtomicDataDict.TOTAL_ENERGY_KEY] = (
                             head_total_e
                         )

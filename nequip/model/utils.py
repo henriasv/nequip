@@ -200,6 +200,9 @@ def model_builder(func=None, *, wrapper_class=None, compile_wrapper_class=None):
                 else:
                     graph_model_module = wrapper_class
 
+                # pop modifiers before passing to builder function
+                modifiers = kwargs.pop("modifiers", None)
+
                 # never script
                 with conditional_torchscript_mode(False):
                     # set dtype and seed
@@ -207,6 +210,17 @@ def model_builder(func=None, *, wrapper_class=None, compile_wrapper_class=None):
                         with isolate_rng():
                             torch.manual_seed(seed)
                             model = f(*args, **kwargs)
+
+                            # apply modifiers (e.g. enable_OpenEquivariance)
+                            # before wrapping with GraphModel/CompileGraphModel
+                            if modifiers:
+                                from .modify_utils import modify
+
+                                model = modify(
+                                    model,
+                                    [{"modifier": m} for m in modifiers],
+                                )
+
                             # wrap with GraphModel
                             graph_model = graph_model_module(
                                 model=model,

@@ -148,13 +148,21 @@ class MultiHeadReadout(GraphModuleMixin, torch.nn.Module):
 
         data[AtomicDataDict.PER_ATOM_ENERGY_KEY] = selected
 
-        # Store all heads' per-atom energies for shared-data optimization.
-        # Shape: [n_atoms, n_heads, 1]. training_step can use this to
-        # compute per-head energies and forces without re-running the model.
-        data["_all_head_per_atom_energies"] = stacked
-
-        # Reduce to total energy
+        # Reduce to total energy (for the selected head)
         data = self.reduce(data)
+
+        # Store per-head total energies as explicit named outputs.
+        # This ensures torch.compile preserves them in the computation graph
+        # (unnamed intermediates like _all_head_per_atom_energies get pruned).
+        # training_step uses these for per-head force computation via autograd.
+        for i, head_name in enumerate(self.head_names):
+            head_per_atom = stacked[:, i, :]
+            head_reduce_data = data.copy()
+            head_reduce_data[AtomicDataDict.PER_ATOM_ENERGY_KEY] = head_per_atom
+            head_reduce_data = self.reduce(head_reduce_data)
+            data[f"_total_energy_{head_name}"] = (
+                head_reduce_data[AtomicDataDict.TOTAL_ENERGY_KEY]
+            )
 
         # Clean up internal per-head feature keys
         for head_name in self.head_names:
