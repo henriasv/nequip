@@ -54,8 +54,19 @@ class EMALightningModule(NequIPLightningModule):
     # The purpose is to take advantage of the compiled state of the base model (torchscript or torch.compile)
     # the purpose of the assert is to safeguard against unexpected load scenarios where
     # `self.model` holds the EMA weights and `self.ema` holds the raw weights (we don't expect this situation to happen, but just in case ...)
-    # we assume that checkpoints will not be saved in between the start and end of `val`, `test`, `predict`
-    # which should be true since Lightning's `ModelCheckpoint` only has a `on_validation_end` hook (no `on_validation_epoch_end` for example), i.e. the hooks we use for the switching should be sufficient for correct behavior
+    def on_save_checkpoint(self, checkpoint):
+        """Ensure checkpoint is always saved with EMA module holding EMA weights.
+
+        Lightning's ``ModelCheckpoint`` callback ``on_validation_end`` fires
+        *before* ``LightningModule.on_validation_end``, so checkpoints can be
+        captured while EMA weights are swapped into the model. We correct for
+        this by swapping back before saving and restoring after.
+        """
+        if not self.ema.is_holding_ema_weights:
+            self.ema.swap_parameters(self.model)
+            checkpoint["state_dict"] = self.state_dict()
+            self.ema.swap_parameters(self.model)
+
     def _assert_ema_status_and_switch(
         self, expect_ema_module_holds_ema_weights: bool, evaluation_mode: str
     ):
@@ -97,6 +108,12 @@ class EMALightningModule(NequIPLightningModule):
         # === load up EMA weights ===
         # logging for sanity checking, especially useful for diamond inheritance subclasses involving EMA
         logger.info("Loading EMA weights for evaluation model.")
+        if getattr(self.ema, "_needs_post_load_swap", False):
+            logger.warning(
+                "Checkpoint was saved with swapped EMA state. Correcting."
+            )
+            self.ema.swap_parameters(self.model)
+            self.ema._needs_post_load_swap = False
         # we expect `self.model` to contain the raw weights
         self._assert_ema_status_and_switch(True, "loading for evaluation")
         return self.model
@@ -225,9 +242,12 @@ class EMAWeights(torch.nn.Module):
         """"""
         self.num_updates = state["num_updates"]
         self.is_holding_ema_weights = state["is_holding_ema_weights"]
-        assert self.is_holding_ema_weights, (
-            "EMA module loaded in a state where it does not contain EMA weights -- the checkpoint file is likely corrupted."
-        )
+        if not self.is_holding_ema_weights:
+            # Checkpoint saved during validation with swapped weights
+            # (Lightning callback ordering issue). Flag for parent to handle.
+            self._needs_post_load_swap = True
+        else:
+            self._needs_post_load_swap = False
 
         # handle possibility of restarts overwriting `decay`
         state_dict_decay = state["decay"]
