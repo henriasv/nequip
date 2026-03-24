@@ -65,13 +65,20 @@ def nequip_make_fx(
     generator = torch.Generator(device).manual_seed(seed)
     single_frame = AtomicDataDict.frame_from_batched(data, 0)
     num_nodes = AtomicDataDict.num_nodes(single_frame)
+    # Remove some nodes to create a different-shaped input for shape
+    # generality checking. Ensure at least 3 nodes remain so the
+    # augmented system has enough atoms for valid neighbor lists.
+    num_to_remove = min(
+        max(2, math.ceil(num_nodes * 0.1)),
+        max(0, num_nodes - 3),
+    )
     node_idx = torch.randint(
         low=0,
         high=num_nodes,
-        size=(max(2, math.ceil(num_nodes * 0.1)),),
+        size=(num_to_remove,),
         generator=generator,
         device=device,
-    )
+    ) if num_to_remove > 0 else torch.tensor([], dtype=torch.long, device=device)
     augmented_data = AtomicDataDict.without_nodes(single_frame, node_idx)
     if AtomicDataDict.BATCH_KEY in data:
         augmented_data = AtomicDataDict.batched_from_list([data, augmented_data])
