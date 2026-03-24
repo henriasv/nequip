@@ -238,6 +238,10 @@ class MetricsManager(torch.nn.ModuleDict):
         # convenient to cache metrics computed last for callbacks
         self.metrics_values_step = {k: None for k in self.metrics.keys()}
         self.metrics_values_epoch = {k: None for k in self.metrics.keys()}
+        # cache live loss tensors (with grad) for gradient-norm callbacks
+        self.metrics_tensors_step: Dict[str, Optional[torch.Tensor]] = {
+            k: None for k in self.metrics.keys()
+        }
 
     def forward(
         self,
@@ -250,6 +254,7 @@ class MetricsManager(torch.nn.ModuleDict):
         Computes and accumulates metrics (intended for use at batch steps).
         """
         self.metrics_values_step = {k: None for k in self.metrics.keys()}
+        self.metrics_tensors_step = {k: None for k in self.metrics.keys()}
         if self.do_weighted_sum:
             weighted_sum = 0.0
         metric_dict = {}
@@ -310,6 +315,7 @@ class MetricsManager(torch.nn.ModuleDict):
 
             metric_dict.update({prefix + metric_name + suffix: metric})
             self.metrics_values_step.update({metric_name: metric.item()})
+            self.metrics_tensors_step.update({metric_name: metric})
 
             if self.do_weighted_sum:
                 coeff: Optional[float] = metric_params["coeff"]
