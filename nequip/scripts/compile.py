@@ -102,7 +102,9 @@ def main(args=None):
 
     parser.add_argument(
         "--modifiers",
-        help="modifiers to apply to the model before compiling",
+        help="modifiers to apply to the model before compiling. "
+        "Use key=value syntax to pass arguments: "
+        "'--modifiers extract_head head_name=dft'",
         nargs="+",
         type=str,
         default=[],
@@ -213,8 +215,28 @@ def main(args=None):
         model, data_from_loaded_model = model
 
     # === modify model ===
-    # for now, we restrict modifiers to those without arguments, i.e. accelerations
-    model = modify(model, [{"modifier": modifier} for modifier in args.modifiers])
+    # === apply modifiers ===
+    # Parse modifier arguments: "modifier_name key1=val1 key2=val2" groups
+    if args.modifiers:
+        modifier_configs = []
+        current_config = None
+        for token in args.modifiers:
+            if "=" in token:
+                # key=value argument for current modifier
+                if current_config is None:
+                    raise ValueError(
+                        f"Modifier argument '{token}' appears before any modifier name"
+                    )
+                key, value = token.split("=", 1)
+                current_config[key] = value
+            else:
+                # New modifier name
+                if current_config is not None:
+                    modifier_configs.append(current_config)
+                current_config = {"modifier": token}
+        if current_config is not None:
+            modifier_configs.append(current_config)
+        model = modify(model, modifier_configs)
 
     # === combine model and global options metadata ===
     # note that model.metadata can be dynamic and so can account for things that change as a result of modifiers
