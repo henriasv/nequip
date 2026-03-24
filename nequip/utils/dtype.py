@@ -116,6 +116,29 @@ def test_model_output_similarity_by_dtype(
             torch.mean(torch.stack(out1_list[k], -1), -1),
             torch.mean(torch.stack(out2_list[k], -1), -1),
         )
+
+        # Handle NaN values (e.g. from energy-only data with NaN forces).
+        # NaN entries are expected when the training data has NaN labels
+        # (handled by ignore_nan in loss/metrics). The compilation check
+        # should verify that both models produce NaN at the same positions,
+        # then compare only finite entries.
+        t1_nan = ~torch.isfinite(t1)
+        t2_nan = ~torch.isfinite(t2)
+        if t1_nan.any() or t2_nan.any():
+            assert torch.equal(t1_nan, t2_nan), (
+                f"Compilation check NaN pattern mismatch for field `{k}`: "
+                f"model1 has {t1_nan.sum().item()} non-finite values, "
+                f"model2 has {t2_nan.sum().item()} non-finite values"
+            )
+            finite_mask = torch.isfinite(t1)
+            if finite_mask.any():
+                t1 = t1[finite_mask]
+                t2 = t2[finite_mask]
+            else:
+                # All NaN — nothing to compare, skip this field
+                del t1, t2
+                continue
+
         err = torch.max(torch.abs(t1 - t2)).item()
         absval = t1.abs().max().item()
 
