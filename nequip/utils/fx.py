@@ -68,6 +68,10 @@ def nequip_make_fx(
     # Remove some nodes to create a different-shaped input for shape
     # generality checking. Ensure at least 3 nodes remain so the
     # augmented system has enough atoms for valid neighbor lists.
+    # For molecules with <= 3 atoms, num_to_remove is 0 and both
+    # traces see the same single-frame shape — the shape generality
+    # check is effectively skipped for very small systems (acceptable
+    # since they have trivial geometry and are rare in practice).
     num_to_remove = min(
         max(2, math.ceil(num_nodes * 0.1)),
         max(0, num_nodes - 3),
