@@ -94,7 +94,7 @@ def modify(
         avail_modifiers: Dict[str, callable],
         modifier_cfg: Dict[str, Any],
         this_model: torch.nn.Module,
-    ) -> None:
+    ) -> torch.nn.Module:
         modifier_cfg = modifier_cfg.copy()
         modifier_name = modifier_cfg.pop("modifier")
         if modifier_name not in avail_modifiers.keys():
@@ -107,6 +107,7 @@ def modify(
         # only skip if doing `persistent_only` and modifier is non-persistent, otherwise always apply
         if not (persistent_only and not is_persistent):
             this_model = modifier_fn(this_model, **modifier_cfg)
+        return this_model
 
     if isinstance(model, torch.nn.ModuleDict):
         # because `model` is actually a `ModuleDict`, we make the modifiers flexible while keeping a simple default for the more common single-model use case
@@ -115,16 +116,22 @@ def modify(
             modifiers = {model_name: modifiers.copy() for model_name in model.keys()}
         # ^ the above allows us to use a common loop over individual sub-models and apply the relevant model-specific modifiers
 
-        for model_name, submodel in model.items():
-            avail_modifiers: Dict[str, callable] = get_all_modifiers(submodel)
+        for model_name in list(model.keys()):
             for modifier in modifiers[model_name]:
-                _apply_modifier(avail_modifiers, modifier, submodel)
+                # Re-collect modifiers each iteration: a prior modifier may have
+                # returned a new model with different registered modifiers.
+                avail_modifiers = get_all_modifiers(model[model_name])
+                model[model_name] = _apply_modifier(
+                    avail_modifiers, modifier, model[model_name]
+                )
 
     elif isinstance(model, torch.nn.Module):
         assert isinstance(modifiers, list)
-        avail_modifiers: Dict[str, callable] = get_all_modifiers(model)
         for modifier in modifiers:
-            _apply_modifier(avail_modifiers, modifier, model)
+            # Re-collect modifiers each iteration: a prior modifier may have
+            # returned a new model with different registered modifiers.
+            avail_modifiers = get_all_modifiers(model)
+            model = _apply_modifier(avail_modifiers, modifier, model)
     else:
         raise RuntimeError("Unrecognized model object found.")
 
