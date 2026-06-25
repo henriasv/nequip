@@ -17,6 +17,8 @@ from nequip.utils.aoti_metadata import (
     NEQUIP_CUSTOM_OPS_LIBS_KEY,
     serialize_aoti_keys,
     embed_custom_ops_libs,
+    embed_custom_op_so_libs,
+    resolve_custom_op_so_paths,
 )
 from omegaconf import OmegaConf
 import hydra
@@ -331,10 +333,30 @@ def main(args=None):
         )
         # embed custom ops libs into the zip so they can be imported before loading
         if NEQUIP_CUSTOM_OPS_LIBS_KEY in metadata:
-            embed_custom_ops_libs(
-                str(args.output_path),
-                set(metadata[NEQUIP_CUSTOM_OPS_LIBS_KEY].split()),
-            )
+            custom_ops_libs = set(metadata[NEQUIP_CUSTOM_OPS_LIBS_KEY].split())
+            # name-based entry for Python/ASE consumers (import before load)
+            embed_custom_ops_libs(str(args.output_path), custom_ops_libs)
+            # Pure-C++ targets (LAMMPS pair styles) cannot import a Python library to
+            # register its custom ops, so additionally embed the actual op `.so`
+            # binaries for the pair style to `dlopen` at model load. Keep the ASE
+            # `.pt2` lean by only doing this for the `pair_*` targets.
+            if args.target is not None and args.target.startswith("pair_"):
+                so_paths = resolve_custom_op_so_paths(custom_ops_libs)
+                if so_paths:
+                    embed_custom_op_so_libs(str(args.output_path), so_paths)
+                    logger.info(
+                        f"Embedded {len(so_paths)} custom-op shared "
+                        f"librar{'y' if len(so_paths) == 1 else 'ies'} into "
+                        f"{args.output_path} for C++ loading: " + ", ".join(so_paths)
+                    )
+                else:
+                    logger.warning(
+                        "Could not resolve any custom-op `.so` to embed for C++ "
+                        f"target '{args.target}' (libs: {sorted(custom_ops_libs)}). "
+                        "The exported .pt2 will not be self-contained; the LAMMPS "
+                        "pair style will need NEQUIP_OP_LIBRARIES or a "
+                        "<model>.oplibs sidecar to find them."
+                    )
         logger.info(f"Exported model saved to {args.output_path}")
         set_workflow_state(None)
         return
