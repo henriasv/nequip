@@ -331,9 +331,32 @@ def main(args=None):
             constant_fold=args.constant_fold,
             seed=_COMPILE_SEED,
         )
-        # embed custom ops libs into the zip so they can be imported before loading
+        # Determine which custom-op libraries this model needs. Primary source is the
+        # model metadata (populated from each module's `_nequip_custom_ops_libs`). As a
+        # robust fallback — especially for C++ (`pair_*`) targets, where a missing entry
+        # would silently yield a non-self-contained .pt2 — also derive the libs from the
+        # requested acceleration modifiers.
+        custom_ops_libs = set()
         if NEQUIP_CUSTOM_OPS_LIBS_KEY in metadata:
-            custom_ops_libs = set(metadata[NEQUIP_CUSTOM_OPS_LIBS_KEY].split())
+            custom_ops_libs |= set(metadata[NEQUIP_CUSTOM_OPS_LIBS_KEY].split())
+        # known acceleration modifiers -> the importable op library they require
+        _MODIFIER_OP_LIBS = {
+            "enable_OpenEquivariance": "openequivariance",
+        }
+        modifier_libs = {
+            _MODIFIER_OP_LIBS[m] for m in args.modifiers if m in _MODIFIER_OP_LIBS
+        }
+        if modifier_libs - custom_ops_libs:
+            logger.warning(
+                "Custom-op libraries "
+                f"{sorted(modifier_libs - custom_ops_libs)} required by the requested "
+                "modifiers were not present in the model metadata "
+                f"('{NEQUIP_CUSTOM_OPS_LIBS_KEY}'); deriving them from the modifiers so "
+                "the exported model stays self-contained."
+            )
+        custom_ops_libs |= modifier_libs
+
+        if custom_ops_libs:
             # name-based entry for Python/ASE consumers (import before load)
             embed_custom_ops_libs(str(args.output_path), custom_ops_libs)
             # Pure-C++ targets (LAMMPS pair styles) cannot import a Python library to
