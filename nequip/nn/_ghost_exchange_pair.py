@@ -96,8 +96,10 @@ class PairNequIPGhostExchangeModule(GhostExchangeModule):
         # `ntotal` from a never-truncated full-size node tensor (positions persist for forces).
         ntotal = data[AtomicDataDict.POSITIONS_KEY].shape[0]
         if ghost_included:
-            # already `ntotal`-wide: take the owned block (marker carries the backed `nlocal`)
-            nlocal = data[AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY].shape[0]
+            # already `ntotal`-wide: take the owned block (marker carries the backed `nlocal`).
+            # Literal key (not AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY): injection-safe when
+            # repacked into an older model whose bundled AtomicDataDict lacks the attribute.
+            nlocal = data["num_local_nodes_marker"].shape[0]
             owned = node_features[:nlocal]
         else:
             owned = node_features
