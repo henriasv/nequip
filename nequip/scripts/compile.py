@@ -2,7 +2,10 @@
 import torch
 
 from ._workflow_utils import set_workflow_state
-from ._compile_utils import COMPILE_TARGET_DICT
+from ._compile_utils import (
+    COMPILE_TARGET_DICT,
+    AOTI_PAIR_NEQUIP_MULTIRANK_TARGET,
+)
 from nequip.model.utils import _EAGER_MODEL_KEY
 from nequip.model.saved_models.load_utils import load_saved_model
 from nequip.model.modify_utils import modify
@@ -152,7 +155,10 @@ def _maybe_rebundle_multirank(input_path, mode, target, modifiers):
     overlay is present). The refresh runs through ``nequip-package update``, which verifies the
     model's predictions are unchanged before writing.
     """
-    if mode != "aotinductor" or target != "pair_nequip":
+    # The multi-GPU path is the dedicated `pair_nequip_multirank` target (it declares the
+    # `num_local_ghost_atoms` / `num_local_nodes_marker` runtime inputs that the single-rank
+    # `pair_nequip` target does not). Only that target needs the truncate-to-nlocal bundled nn.
+    if mode != "aotinductor" or target != AOTI_PAIR_NEQUIP_MULTIRANK_TARGET:
         return input_path
     if _PAIR_NEQUIP_MULTIRANK_MODIFIER not in (modifiers or []):
         return input_path
@@ -418,8 +424,12 @@ def main(args=None):
     }
 
     # stamp multirank capability so the pair style can guard multi-rank runs (the C++ side
-    # aborts with a clear message if a single-rank `.pt2` is run on >1 MPI rank).
-    if _PAIR_NEQUIP_MULTIRANK_MODIFIER in (args.modifiers or []):
+    # aborts with a clear message if a single-rank `.pt2` is run on >1 MPI rank). Gate on the
+    # multirank *target* — not the modifier — so the stamp always agrees with the declared
+    # inputs. Stamping on the modifier alone produced a single-rank `.pt2` (target `pair_nequip`)
+    # carrying `pair_nequip_multirank=1`, which the pair style flagged as metadata/input
+    # disagreement. The declared `num_local_ghost_atoms` input remains the authoritative signal.
+    if args.target == AOTI_PAIR_NEQUIP_MULTIRANK_TARGET:
         metadata[_PAIR_NEQUIP_MULTIRANK_META_KEY] = "1"
 
     logger.debug(model)
