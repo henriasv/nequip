@@ -91,6 +91,19 @@ class AtomwiseReduce(GraphModuleMixin, torch.nn.Module):
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         field = data[self.field]
+        if AtomicDataDict.NUM_LOCAL_GHOST_NODES_KEY in data:
+            # native multi-rank `pair_nequip`: zero out ghost-node contributions so this
+            # reduction (and the forces obtained by differentiating it) sums over owned atoms
+            # only. The mask is a guard-free elementwise comparison against the owned count
+            # `nlocal` (a 0-dim tensor, NOT read via `.item()`), so it introduces no
+            # data-dependent sizes and AOT-exports cleanly. With `nghost = 0` (single-rank /
+            # the AOT export example / the correctness gate) the mask is all-True and this is a
+            # no-op, exactly reproducing plain `pair_nequip`.
+            nlocal = data[AtomicDataDict.NUM_LOCAL_GHOST_NODES_KEY][0]
+            owned_mask = torch.arange(field.size(0), device=field.device) < nlocal
+            field = field * owned_mask.reshape(
+                (-1,) + (1,) * (field.dim() - 1)
+            ).to(field.dtype)
         if AtomicDataDict.BATCH_KEY in data:
             result = scatter(
                 field,
