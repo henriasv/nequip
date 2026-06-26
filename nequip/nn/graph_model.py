@@ -72,6 +72,11 @@ class GraphModel(GraphModuleMixin, torch.nn.Module):
             # for LAMMPS ML-IAP
             AtomicDataDict.LMP_MLIAP_DATA_KEY: None,
             AtomicDataDict.NUM_LOCAL_GHOST_NODES_KEY: None,
+            # native multi-rank `pair_nequip` truncate-to-nlocal owned-count marker -- whitelisted
+            # here so it survives `GraphModel.forward`'s input filter and reaches InteractionBlock
+            # (which reads `marker.shape[0]` as the backed `nlocal`); without this it is silently
+            # dropped and every layer falls back to the `ntotal` (no-truncation) path.
+            AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY: None,
         }
         model_input_fields = AtomicDataDict._fix_irreps_dict(model_input_fields)
         irreps_in.update(model_input_fields)
@@ -152,4 +157,14 @@ class GraphModel(GraphModuleMixin, torch.nn.Module):
         for k in self.model_input_fields:
             if k in data:
                 new_data[k] = data[k]
+        # truncate-to-nlocal owned-count marker: pass it through even when it is absent from
+        # `model_input_fields`. That attribute is a *saved* list restored from the pickle at
+        # load time (`__init__` is not re-run for a packaged model), so the irreps_in whitelist
+        # above only reaches freshly-constructed models; a loaded model would otherwise filter
+        # the marker out here and every `InteractionBlock` would silently fall back to the
+        # all-`ntotal` (no-truncation) path.
+        if AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY in data:
+            new_data[AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY] = data[
+                AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY
+            ]
         return self.model(new_data)

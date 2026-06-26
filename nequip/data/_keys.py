@@ -114,6 +114,15 @@ LMP_MLIAP_DATA_KEY: Final[str] = "lmp_mliap_data"
 # but possible for reuse with other integrations based on similar local-ghost schemes
 NUM_LOCAL_GHOST_NODES_KEY: Final[str] = "num_local_ghost_atoms"
 
+# === native multi-rank `pair_nequip` truncation key ===
+# A rank-1 marker tensor of shape ``(num_local_atoms,)`` whose ONLY purpose is to carry the
+# owned-atom count as a *backed* dynamic dimension (`marker.shape[0]`) distinct from the
+# `num_nodes` (== ntotal) dimension. The truncate-to-nlocal reformulation slices every layer's
+# per-node ops down to this owned count; reading the count as a tensor *dimension* (not a tensor
+# *value* via `.item()`) keeps it a backed symint so `torch.export`/AOTInductor never hits the
+# data-dependent (unbacked) guard wall. Contents are irrelevant — only the size-0 dim is used.
+NUM_LOCAL_NODES_MARKER_KEY: Final[str] = "num_local_nodes_marker"
+
 # make a list of allowed keys
 ALLOWED_KEYS: List[str] = [v for k, v in globals().items() if k.endswith("_KEY")]
 # check that the fields don't have "." (to avoid clashes with nn parameter names)

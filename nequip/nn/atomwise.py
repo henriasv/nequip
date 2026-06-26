@@ -105,9 +105,14 @@ class AtomwiseReduce(GraphModuleMixin, torch.nn.Module):
                 (-1,) + (1,) * (field.dim() - 1)
             ).to(field.dtype)
         if AtomicDataDict.BATCH_KEY in data:
+            # Align the `ntotal`-length batch index to the (possibly truncated-to-nlocal) field
+            # rows. In the truncate-to-nlocal formulation `field` spans only the `nlocal` owned
+            # nodes while `BATCH_KEY` still spans `ntotal`; slicing it makes the per-frame sum run
+            # over owned atoms by construction. No-op when `field` is `ntotal` (mliap / no-trunc).
+            batch = data[AtomicDataDict.BATCH_KEY][: field.size(0)]
             result = scatter(
                 field,
-                data[AtomicDataDict.BATCH_KEY],
+                batch,
                 dim=0,
                 dim_size=AtomicDataDict.num_frames(data),
                 reduce=self.reduce,

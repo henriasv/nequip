@@ -20,9 +20,13 @@ PAIR_NEQUIP_INPUTS = [
 ]
 
 # multi-rank native `pair_nequip` additionally takes the owned/ghost atom counts
-# (`[nlocal, nghost]`) so the per-layer ghost exchange can route the feature halo.
+# (`[nlocal, nghost]`) so the per-layer ghost exchange can route the feature halo, plus a
+# `(nlocal,)` marker tensor that carries the owned count as a *backed* dynamic dimension. The
+# truncate-to-nlocal reformulation reads `nlocal` from `marker.shape[0]` (a tensor dimension,
+# never `.item()`), so per-node ops are computed only on owned atoms while staying AOT-exportable.
 PAIR_NEQUIP_MULTIRANK_INPUTS = PAIR_NEQUIP_INPUTS + [
     AtomicDataDict.NUM_LOCAL_GHOST_NODES_KEY,
+    AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY,
 ]
 
 BATCH_INPUTS = PAIR_NEQUIP_INPUTS + [
@@ -64,20 +68,42 @@ def single_frame_data_settings(data):
     return data
 
 
+def single_frame_pair_nequip_multirank_batch_map_settings(batch_map):
+    # single-frame settings (graph dim static), plus a dedicated `nlocal` dynamic dimension for
+    # the owned-atom marker, independent of `node` (== ntotal). The relation `nlocal <= ntotal`
+    # is not declared here; the truncate-to-nlocal slice/`slice_scatter` ops impose it as a
+    # deferred runtime assert during export, which is satisfiable at `nghost == 0` (the
+    # single-rank correctness gate) and `nghost > 0` (multi-rank) alike.
+    batch_map = single_frame_batch_map_settings(batch_map)
+    batch_map["nlocal"] = torch.export.dynamic_shapes.Dim(
+        "nlocal", min=1, max=torch.inf
+    )
+    return batch_map
+
+
 def single_frame_pair_nequip_multirank_data_settings(data):
-    # single-frame settings, plus inject the owned/ghost atom counts `[nlocal, nghost]` that the
-    # multi-rank pair style supplies at runtime (a runtime input; this only sets the tracing
-    # example). The reformulated model reads these counts solely through guard-free elementwise
-    # ops (an owned mask in `AtomwiseReduce`), never via `.item()`, so the example values impose
-    # no tracing constraints. We use ``nghost = 0`` (single-rank-equivalent, consistent with the
-    # single-frame example geometry, which has no ghost rows); the all-owned mask makes the
-    # exported `.pt2` reproduce plain ``pair_nequip``, which the correctness gate checks.
+    # single-frame settings, plus the two multi-rank runtime inputs (this only sets the tracing
+    # example; the pair style overrides the values at runtime):
+    #   * `num_local_ghost_atoms` = `[nlocal, nghost]` (drives the guard-free owned mask), and
+    #   * `num_local_nodes_marker` = a `(nlocal,)` tensor whose dim-0 carries the *backed* owned
+    #     count that the truncate-to-nlocal reformulation slices on.
+    # CRUCIAL: the example MUST have `nghost > 0` (here `nlocal = n_nodes // 2`). With
+    # `nghost == 0` the `node` and `nlocal` dims would coincide in the example and export
+    # specializes the ghost block away (baking `ntotal <= nlocal`), which then fails for real
+    # multi-rank runs. With genuine ghosts the two dims stay independent and the `slice_scatter`
+    # expansion in `PairNequIPGhostExchangeModule` exports guard-cleanly for any `nlocal <=
+    # ntotal`. Example values are otherwise physically irrelevant (the AOT-vs-eager sanity check
+    # only needs self-consistency, and the single-rank gate runs `nghost == 0`).
     data = single_frame_data_settings(data)
+    device = data[AtomicDataDict.POSITIONS_KEY].device
     n_nodes = data[AtomicDataDict.POSITIONS_KEY].shape[0]
+    n_local = max(1, n_nodes // 2)
+    n_ghost = n_nodes - n_local
     data[AtomicDataDict.NUM_LOCAL_GHOST_NODES_KEY] = torch.tensor(
-        [n_nodes, 0],
-        dtype=torch.int64,
-        device=data[AtomicDataDict.POSITIONS_KEY].device,
+        [n_local, n_ghost], dtype=torch.int64, device=device
+    )
+    data[AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY] = torch.zeros(
+        n_local, dtype=torch.int64, device=device
     )
     return data
 
@@ -99,7 +125,7 @@ PAIR_NEQUIP_TARGET = {
 PAIR_NEQUIP_MULTIRANK_TARGET = {
     "input": PAIR_NEQUIP_MULTIRANK_INPUTS,
     "output": LMP_OUTPUTS,
-    "batch_map_settings": single_frame_batch_map_settings,
+    "batch_map_settings": single_frame_pair_nequip_multirank_batch_map_settings,
     "data_settings": single_frame_pair_nequip_multirank_data_settings,
 }
 ASE_TARGET = {

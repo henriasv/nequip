@@ -17,6 +17,7 @@ _DEFAULT_LONG_FIELDS: Set[str] = {
     _keys.BATCH_KEY,
     _keys.NUM_NODES_KEY,
     _keys.NUM_LOCAL_GHOST_NODES_KEY,
+    _keys.NUM_LOCAL_NODES_MARKER_KEY,
     _keys.DATASET_KEY,
     _keys.TOTAL_CHARGE_KEY,
     _keys.TOTAL_SPIN_KEY,
@@ -30,6 +31,11 @@ _DEFAULT_GRAPH_FIELDS: Set[str] = {
     _keys.CELL_KEY,
     _keys.NUM_NODES_KEY,
     _keys.NUM_LOCAL_GHOST_NODES_KEY,
+    # `num_local_nodes_marker` is graph-typed (NOT node-typed): it has `nlocal` rows, not
+    # `num_nodes` rows, so node-machinery like `AtomicDataDict.without_nodes` (used by
+    # `nequip_make_fx`'s second trace) must copy it untouched rather than apply a `num_nodes`
+    # mask. Its single dim is special-cased to the `nlocal` dynamic dim in `get_dynamic_shapes`.
+    _keys.NUM_LOCAL_NODES_MARKER_KEY,
     _keys.DATASET_KEY,
     _keys.TOTAL_CHARGE_KEY,
     _keys.TOTAL_SPIN_KEY,
@@ -227,6 +233,13 @@ def get_dynamic_shapes(input_fields, batch_map):
         # special case edge indices (2, num_edges), which won't have a field type
         if field == _keys.EDGE_INDEX_KEY:
             dynamic_shapes += ({0: torch.export.Dim.STATIC, 1: batch_map["edge"]},)
+            continue
+        # special case the owned-atom marker `(nlocal,)`: its single dim is the dedicated
+        # `nlocal` dynamic dim (distinct from `node`==ntotal), so the truncate-to-nlocal
+        # reformulation can read a *backed* owned count. Only the multi-rank `pair_nequip`
+        # target supplies this field (and an "nlocal" entry in `batch_map`).
+        if field == _keys.NUM_LOCAL_NODES_MARKER_KEY:
+            dynamic_shapes += ({0: batch_map["nlocal"]},)
             continue
         field_type = get_field_type(field, error_on_unregistered=False)
         if field_type is not None:
