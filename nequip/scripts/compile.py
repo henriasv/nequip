@@ -53,6 +53,133 @@ def _parse_bounds_to_Dim(name: str, bounds_str: str):
         )
 
 
+# === pair_nequip multi-GPU (multirank) re-bundle support ===
+# The native multi-GPU pair_nequip path needs the truncate-to-nlocal model code in the
+# packaged model's *bundled* `nn` source. A `.nequip.zip` carries its own frozen copy of
+# that source (`torch.package` isolates it), so a model packaged before this support — or
+# with stock upstream nequip — loads stale `nn` and would silently run the all-`ntotal`
+# (non-truncating) path or fault under the multi-rank ghost exchange. When compiling for the
+# pair_nequip multirank target we detect a stale bundle and refresh it in place from the
+# *installed* (container) nequip before loading. See `nequip/nn/_ghost_exchange_pair.py`.
+_PAIR_NEQUIP_MULTIRANK_MODIFIER: Final[str] = "enable_PairNequIPGhostExchange"
+_PAIR_NEQUIP_MULTIRANK_META_KEY: Final[str] = "pair_nequip_multirank"
+# nn source files that carry the truncate-to-nlocal / marker plumbing (validated repack set)
+_MULTIRANK_NN_FILES: Final[tuple] = (
+    "_ghost_exchange_base.py",
+    "_ghost_exchange_pair.py",
+    "interaction_block.py",
+    "atomwise.py",
+    "graph_model.py",
+    "pair_potential.py",
+)
+# literal marker key the patched nn references (the bundled AtomicDataDict predates the
+# `NUM_LOCAL_NODES_MARKER_KEY` attribute, so the patched source keys it by this string)
+_MULTIRANK_SENTINEL: Final[str] = "num_local_nodes_marker"
+
+
+def _bundle_is_multirank_capable(zip_path) -> bool:
+    """Whether a packaged model's bundled ``nn`` already carries truncate-to-nlocal support.
+
+    Detected by the ``num_local_nodes_marker`` sentinel in the bundled
+    ``interaction_block.py``. Returns ``True`` (i.e. skip the re-bundle) if the package
+    cannot be inspected in the expected layout — refreshing a non-standard package would be
+    unsafe, and the pair style's runtime multi-rank guard is the backstop.
+    """
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            hits = [
+                n
+                for n in zf.namelist()
+                if n.endswith("/nequip/nn/interaction_block.py")
+            ]
+            if not hits:
+                return True
+            return _MULTIRANK_SENTINEL in zf.read(hits[0]).decode("utf-8", "replace")
+    except (zipfile.BadZipFile, OSError):
+        return True
+
+
+def _multirank_zip_prefix(zip_path):
+    """The ``torch.package`` ``<pkg_dir>`` prefix inside a packaged model, or ``None``."""
+    import zipfile
+
+    with zipfile.ZipFile(zip_path) as zf:
+        hits = [
+            n for n in zf.namelist() if n.endswith("/nequip/nn/interaction_block.py")
+        ]
+    return hits[0].rsplit("/nequip/nn/", 1)[0] if hits else None
+
+
+def _maybe_rebundle_multirank(input_path, mode, target, modifiers):
+    """Refresh a stale packaged model for the pair_nequip multirank target.
+
+    Returns the path to load from: the original ``input_path`` when no refresh is
+    needed/possible, otherwise a fresh ``.nequip.zip`` whose bundled ``nn`` source has been
+    replaced from the installed nequip. The refresh runs through ``nequip-package update``,
+    which verifies the model's predictions are unchanged before writing.
+    """
+    if mode != "aotinductor" or target != "pair_nequip":
+        return input_path
+    if _PAIR_NEQUIP_MULTIRANK_MODIFIER not in (modifiers or []):
+        return input_path
+
+    p = pathlib.Path(input_path)
+    if not (str(input_path).endswith(".nequip.zip") and p.is_file()):
+        # checkpoint / nequip.net ref / missing file: nothing to refresh here. If the
+        # bundled code is stale the pair style's runtime multi-rank guard reports it.
+        return input_path
+
+    if _bundle_is_multirank_capable(p):
+        logger.info(
+            "pair_nequip multirank: bundled nequip.nn already supports truncate-to-nlocal; "
+            "no re-bundle needed."
+        )
+        return input_path
+
+    prefix = _multirank_zip_prefix(p)
+    if prefix is None:
+        logger.warning(
+            "pair_nequip multirank: could not find `nequip/nn/` inside %s to re-bundle; "
+            "proceeding as-is. If this is a packaged NequIP model, re-bundle it manually "
+            "with `nequip-package update` (see the multi-GPU pair_nequip docs).",
+            input_path,
+        )
+        return input_path
+
+    from nequip.scripts.package import main as _package_main
+
+    tmp_out = p.with_name(p.name[: -len(".nequip.zip")] + ".mrt-auto.nequip.zip")
+    if tmp_out.exists():
+        tmp_out.unlink()
+    replace_args = []
+    for f in _MULTIRANK_NN_FILES:
+        # 1-arg `--replace`: nequip-package auto-resolves the local file from the *installed*
+        # nequip package — i.e. the container's patched source, exactly what we want.
+        replace_args += ["--replace", f"{prefix}/nequip/nn/{f}"]
+    logger.warning(
+        "pair_nequip multirank: bundled nequip.nn predates truncate-to-nlocal; re-bundling "
+        "%s from the installed nequip (%d nn files) -> %s (predictions verified unchanged).",
+        p.name,
+        len(_MULTIRANK_NN_FILES),
+        tmp_out.name,
+    )
+    try:
+        _package_main(["update", str(p), str(tmp_out), *replace_args])
+    except Exception as e:
+        raise RuntimeError(
+            f"pair_nequip multirank auto re-bundle of '{input_path}' failed: {e}\n"
+            "The model could not be refreshed from the installed nequip. Fix options:\n"
+            "  (1) ensure the container's nequip carries the multi-GPU pair_nequip patches "
+            "(the pair-nequip-multigpu build);\n"
+            "  (2) re-bundle manually: `nequip-package update <src> <out> --replace "
+            "<pkg>/nequip/nn/interaction_block.py ...` then pass <out> to nequip-compile;\n"
+            "  (3) re-export the model from its checkpoint with a current nequip."
+        ) from e
+    return str(tmp_out)
+
+
 def main(args=None):
     # === parse inputs ===
     parser = argparse.ArgumentParser(
@@ -203,6 +330,11 @@ def main(args=None):
             "`output-path` must end with the `.nequip.pt2` extension for `aotinductor` compile mode"
         )
 
+    # === pair_nequip multirank: auto-refresh stale bundled nn (see helper above) ===
+    args.input_path = _maybe_rebundle_multirank(
+        args.input_path, args.mode, args.target, args.modifiers
+    )
+
     # === load model ===
     # For aotinductor mode, we also need the data dict (unless data_path is provided)
     need_data_from_model = args.mode == "aotinductor" and args.data_path is None
@@ -234,6 +366,11 @@ def main(args=None):
     metadata = {
         k: str(int(v)) if isinstance(v, bool) else v for k, v in metadata.items()
     }
+
+    # stamp multirank capability so the pair style can guard multi-rank runs (the C++ side
+    # aborts with a clear message if a single-rank `.pt2` is run on >1 MPI rank).
+    if _PAIR_NEQUIP_MULTIRANK_MODIFIER in (args.modifiers or []):
+        metadata[_PAIR_NEQUIP_MULTIRANK_META_KEY] = "1"
 
     logger.debug(model)
 
