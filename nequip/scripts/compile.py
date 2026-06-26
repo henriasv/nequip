@@ -59,8 +59,16 @@ def _parse_bounds_to_Dim(name: str, bounds_str: str):
 # that source (`torch.package` isolates it), so a model packaged before this support — or
 # with stock upstream nequip — loads stale `nn` and would silently run the all-`ntotal`
 # (non-truncating) path or fault under the multi-rank ghost exchange. When compiling for the
-# pair_nequip multirank target we detect a stale bundle and refresh it in place from the
-# *installed* (container) nequip before loading. See `nequip/nn/_ghost_exchange_pair.py`.
+# pair_nequip multirank target we detect a stale bundle and refresh it in place before loading.
+#
+# Crucially the refresh injects a *model-era* overlay (the validated truncate-to-nlocal source,
+# shipped alongside the container) — NOT the container's own installed nequip. A packaged model
+# is *unpickled*: its module `__init__` never re-runs, so its frozen module instances keep
+# whatever attributes/submodules existed when it was packaged. Injecting a newer-upstream `nn`
+# whose `forward` references a submodule the old instance lacks (e.g. the `avg_num_neighbors_norm`
+# refactor) raises `AttributeError` on the first forward. The shipped overlay matches the era of
+# the models people actually run (the OAM family), so its `forward` only touches attributes the
+# pickled instances really have. See `nequip/nn/_ghost_exchange_pair.py`.
 _PAIR_NEQUIP_MULTIRANK_MODIFIER: Final[str] = "enable_PairNequIPGhostExchange"
 _PAIR_NEQUIP_MULTIRANK_META_KEY: Final[str] = "pair_nequip_multirank"
 # nn source files that carry the truncate-to-nlocal / marker plumbing (validated repack set)
@@ -75,6 +83,29 @@ _MULTIRANK_NN_FILES: Final[tuple] = (
 # literal marker key the patched nn references (the bundled AtomicDataDict predates the
 # `NUM_LOCAL_NODES_MARKER_KEY` attribute, so the patched source keys it by this string)
 _MULTIRANK_SENTINEL: Final[str] = "num_local_nodes_marker"
+# Shipped model-era overlay: the validated truncate-to-nlocal `nn` source set used for the
+# re-bundle (see the block above for why a *model-era* — not installed — source is required).
+# Resolution: `$NEQUIP_MULTIRANK_PKGSRC` then the baked container default. Absent/partial ->
+# fall back to the installed nequip (correct only when the model matches the installed era).
+_MULTIRANK_OVERLAY_ENV: Final[str] = "NEQUIP_MULTIRANK_PKGSRC"
+_MULTIRANK_OVERLAY_DEFAULT: Final[str] = "/opt/nequip-multirank-pkgsrc"
+
+
+def _multirank_overlay_dir():
+    """Directory of the shipped model-era multirank ``nn`` overlay, or ``None``.
+
+    The directory must contain *every* file in :data:`_MULTIRANK_NN_FILES`; a partial overlay
+    is ignored (treated as absent) so the re-bundle never mixes overlay and installed sources.
+    """
+    import os
+
+    for cand in (os.environ.get(_MULTIRANK_OVERLAY_ENV), _MULTIRANK_OVERLAY_DEFAULT):
+        if not cand:
+            continue
+        d = pathlib.Path(cand)
+        if d.is_dir() and all((d / f).is_file() for f in _MULTIRANK_NN_FILES):
+            return d
+    return None
 
 
 def _bundle_is_multirank_capable(zip_path) -> bool:
@@ -117,8 +148,9 @@ def _maybe_rebundle_multirank(input_path, mode, target, modifiers):
 
     Returns the path to load from: the original ``input_path`` when no refresh is
     needed/possible, otherwise a fresh ``.nequip.zip`` whose bundled ``nn`` source has been
-    replaced from the installed nequip. The refresh runs through ``nequip-package update``,
-    which verifies the model's predictions are unchanged before writing.
+    replaced from the shipped model-era overlay (falling back to the installed nequip when no
+    overlay is present). The refresh runs through ``nequip-package update``, which verifies the
+    model's predictions are unchanged before writing.
     """
     if mode != "aotinductor" or target != "pair_nequip":
         return input_path
@@ -153,15 +185,28 @@ def _maybe_rebundle_multirank(input_path, mode, target, modifiers):
     tmp_out = p.with_name(p.name[: -len(".nequip.zip")] + ".mrt-auto.nequip.zip")
     if tmp_out.exists():
         tmp_out.unlink()
+    overlay = _multirank_overlay_dir()
     replace_args = []
     for f in _MULTIRANK_NN_FILES:
-        # 1-arg `--replace`: nequip-package auto-resolves the local file from the *installed*
-        # nequip package — i.e. the container's patched source, exactly what we want.
-        replace_args += ["--replace", f"{prefix}/nequip/nn/{f}"]
+        if overlay is not None:
+            # 2-arg `--replace <archive_member> <local_file>`: inject the shipped *model-era*
+            # overlay so the refreshed bundle stays compatible with older pickled instances.
+            replace_args += ["--replace", f"{prefix}/nequip/nn/{f}", str(overlay / f)]
+        else:
+            # 1-arg fallback: auto-resolve from the *installed* nequip. Correct only when the
+            # model's bundled nn matches the installed era; otherwise `update`'s prediction
+            # verification (or the first forward) fails and we surface re-export guidance below.
+            replace_args += ["--replace", f"{prefix}/nequip/nn/{f}"]
+    src_desc = (
+        f"the shipped model-era overlay ({overlay})"
+        if overlay is not None
+        else "the installed nequip (no overlay found)"
+    )
     logger.warning(
         "pair_nequip multirank: bundled nequip.nn predates truncate-to-nlocal; re-bundling "
-        "%s from the installed nequip (%d nn files) -> %s (predictions verified unchanged).",
+        "%s from %s (%d nn files) -> %s (predictions verified unchanged).",
         p.name,
+        src_desc,
         len(_MULTIRANK_NN_FILES),
         tmp_out.name,
     )
@@ -170,12 +215,17 @@ def _maybe_rebundle_multirank(input_path, mode, target, modifiers):
     except Exception as e:
         raise RuntimeError(
             f"pair_nequip multirank auto re-bundle of '{input_path}' failed: {e}\n"
-            "The model could not be refreshed from the installed nequip. Fix options:\n"
-            "  (1) ensure the container's nequip carries the multi-GPU pair_nequip patches "
-            "(the pair-nequip-multigpu build);\n"
-            "  (2) re-bundle manually: `nequip-package update <src> <out> --replace "
-            "<pkg>/nequip/nn/interaction_block.py ...` then pass <out> to nequip-compile;\n"
-            "  (3) re-export the model from its checkpoint with a current nequip."
+            f"(injection source: {src_desc})\n"
+            "This usually means the model's nequip era does not match the injected nn — a "
+            "newer-upstream `nn` references a submodule the model's pickled instances lack "
+            "(the package is unpickled, so its `__init__` never re-runs). Fix options:\n"
+            "  (1) re-export the model from its checkpoint with a current nequip — this bakes "
+            "truncate-to-nlocal in natively, no re-bundle needed (the robust, era-agnostic fix);\n"
+            "  (2) point $NEQUIP_MULTIRANK_PKGSRC at a model-era nn overlay (the validated "
+            "truncate-to-nlocal source set matching THIS model's nequip);\n"
+            "  (3) re-bundle manually: `nequip-package update <src> <out> --replace "
+            "<pkg>/nequip/nn/interaction_block.py <overlay>/interaction_block.py ...` (one "
+            "`--replace` pair per nn file) then pass <out> to nequip-compile."
         ) from e
     return str(tmp_out)
 
