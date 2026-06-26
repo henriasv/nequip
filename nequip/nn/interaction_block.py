@@ -158,7 +158,7 @@ class InteractionBlock(GraphModuleMixin, torch.nn.Module):
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         if AtomicDataDict.LMP_MLIAP_DATA_KEY in data:
             num_local_nodes = self._get_mliap_num_local(data)
-        elif AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY in data:
+        elif "num_local_nodes_marker" in data:
             # Native multi-rank `pair_nequip` (truncate-to-nlocal): the owned count is the
             # size-0 of the marker input — a *backed* dynamic dim read as a tensor dimension,
             # never via `.item()`, so it carries no data-dependent (unbacked) size and
@@ -166,7 +166,9 @@ class InteractionBlock(GraphModuleMixin, torch.nn.Module):
             # (cutting the redundant ghost-node compute of the all-`ntotal` formulation); the
             # per-layer `ghost_exchange` re-expands owned features back to `ntotal` (filling
             # ghost rows from their owners on other ranks) right before the TP-scatter.
-            num_local_nodes = data[AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY].shape[0]
+            # Literal key (not AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY): injection-safe when
+            # this source is repacked into an older model whose AtomicDataDict lacks it.
+            num_local_nodes = data["num_local_nodes_marker"].shape[0]
         else:
             # Plain single-rank `pair_nequip` / ASE: no ghosts, so `nlocal == ntotal` and the
             # truncations below are no-ops. Backed `num_nodes` keeps the graph export-clean.
