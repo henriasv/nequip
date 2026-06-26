@@ -159,6 +159,12 @@ class InteractionBlock(GraphModuleMixin, torch.nn.Module):
         if AtomicDataDict.LMP_MLIAP_DATA_KEY in data:
             num_local_nodes = self._get_mliap_num_local(data)
         else:
+            # For native multi-rank `pair_nequip` this is `ntotal` (owned + ghost): every layer
+            # is computed on all nodes (the per-layer ghost exchange overwrites ghost features
+            # with their owners' values, so owned features are exact), and the owned-only energy
+            # reduction is enforced downstream in `AtomwiseReduce` by a guard-free owned mask.
+            # Keeping the backed `num_nodes` here means the traced graph has no data-dependent
+            # (unbacked) sizes and AOT-exports cleanly — identical code path to plain pair_nequip.
             num_local_nodes = AtomicDataDict.num_nodes(data)
 
         x = data[AtomicDataDict.NODE_FEATURES_KEY]
@@ -196,7 +202,8 @@ class InteractionBlock(GraphModuleMixin, torch.nn.Module):
             edge_weight=self.edge_mlp(data[AtomicDataDict.EDGE_EMBEDDING_KEY]),
             edge_dst=data[AtomicDataDict.EDGE_INDEX_KEY][0],
             edge_src=data[AtomicDataDict.EDGE_INDEX_KEY][1],
-        )[:num_local_nodes]
+        )
+        x = x[:num_local_nodes]
 
         x = self.linear_2(x)
 

@@ -7,6 +7,7 @@ from typing import Dict, List, Callable, Union
 # standard sets of input and output fields for specific integrations
 
 AOTI_PAIR_NEQUIP_TARGET = "pair_nequip"
+AOTI_PAIR_NEQUIP_MULTIRANK_TARGET = "pair_nequip_multirank"
 AOTI_ASE_TARGET = "ase"
 AOTI_BATCH_TARGET = "batch"
 
@@ -16,6 +17,12 @@ PAIR_NEQUIP_INPUTS = [
     AtomicDataDict.ATOM_TYPE_KEY,
     AtomicDataDict.CELL_KEY,
     AtomicDataDict.EDGE_CELL_SHIFT_KEY,
+]
+
+# multi-rank native `pair_nequip` additionally takes the owned/ghost atom counts
+# (`[nlocal, nghost]`) so the per-layer ghost exchange can route the feature halo.
+PAIR_NEQUIP_MULTIRANK_INPUTS = PAIR_NEQUIP_INPUTS + [
+    AtomicDataDict.NUM_LOCAL_GHOST_NODES_KEY,
 ]
 
 BATCH_INPUTS = PAIR_NEQUIP_INPUTS + [
@@ -57,6 +64,24 @@ def single_frame_data_settings(data):
     return data
 
 
+def single_frame_pair_nequip_multirank_data_settings(data):
+    # single-frame settings, plus inject the owned/ghost atom counts `[nlocal, nghost]` that the
+    # multi-rank pair style supplies at runtime (a runtime input; this only sets the tracing
+    # example). The reformulated model reads these counts solely through guard-free elementwise
+    # ops (an owned mask in `AtomwiseReduce`), never via `.item()`, so the example values impose
+    # no tracing constraints. We use ``nghost = 0`` (single-rank-equivalent, consistent with the
+    # single-frame example geometry, which has no ghost rows); the all-owned mask makes the
+    # exported `.pt2` reproduce plain ``pair_nequip``, which the correctness gate checks.
+    data = single_frame_data_settings(data)
+    n_nodes = data[AtomicDataDict.POSITIONS_KEY].shape[0]
+    data[AtomicDataDict.NUM_LOCAL_GHOST_NODES_KEY] = torch.tensor(
+        [n_nodes, 0],
+        dtype=torch.int64,
+        device=data[AtomicDataDict.POSITIONS_KEY].device,
+    )
+    return data
+
+
 def batched_data_settings(data):
     assert AtomicDataDict.BATCH_KEY in data
     assert AtomicDataDict.NUM_NODES_KEY in data
@@ -70,6 +95,12 @@ PAIR_NEQUIP_TARGET = {
     "output": LMP_OUTPUTS,
     "batch_map_settings": single_frame_batch_map_settings,
     "data_settings": single_frame_data_settings,
+}
+PAIR_NEQUIP_MULTIRANK_TARGET = {
+    "input": PAIR_NEQUIP_MULTIRANK_INPUTS,
+    "output": LMP_OUTPUTS,
+    "batch_map_settings": single_frame_batch_map_settings,
+    "data_settings": single_frame_pair_nequip_multirank_data_settings,
 }
 ASE_TARGET = {
     "input": PAIR_NEQUIP_INPUTS,
@@ -86,6 +117,7 @@ BATCH_TARGET = {
 
 COMPILE_TARGET_DICT = {
     AOTI_PAIR_NEQUIP_TARGET: PAIR_NEQUIP_TARGET,
+    AOTI_PAIR_NEQUIP_MULTIRANK_TARGET: PAIR_NEQUIP_MULTIRANK_TARGET,
     AOTI_ASE_TARGET: ASE_TARGET,
     AOTI_BATCH_TARGET: BATCH_TARGET,
 }

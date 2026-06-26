@@ -29,6 +29,7 @@ _DEFAULT_GRAPH_FIELDS: Set[str] = {
     _keys.PBC_KEY,
     _keys.CELL_KEY,
     _keys.NUM_NODES_KEY,
+    _keys.NUM_LOCAL_GHOST_NODES_KEY,
     _keys.DATASET_KEY,
     _keys.TOTAL_CHARGE_KEY,
     _keys.TOTAL_SPIN_KEY,
@@ -236,7 +237,12 @@ def get_dynamic_shapes(input_fields, batch_map):
             # - num_atoms: (num_frames,)
             # trying to impose dim=1 static on rank-1 tensors can fail in export
             # hence the following branches
-            if field in (_keys.ATOM_TYPE_KEY, _keys.BATCH_KEY, _keys.NUM_NODES_KEY):
+            if field in (
+                _keys.ATOM_TYPE_KEY,
+                _keys.BATCH_KEY,
+                _keys.NUM_NODES_KEY,
+                _keys.NUM_LOCAL_GHOST_NODES_KEY,
+            ):
                 shape_dict = {0: batch_map[field_type]}
             else:
                 shape_dict = {0: batch_map[field_type], 1: torch.export.Dim.STATIC}

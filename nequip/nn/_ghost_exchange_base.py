@@ -55,3 +55,25 @@ class NoOpGhostExchangeModule(GhostExchangeModule):
             return new
 
         return replace_submodules(model, cls, factory)
+
+    @model_modifier(persistent=True, private=True)
+    @classmethod
+    def enable_PairNequIPGhostExchange(cls, model):
+        """Enable native ``pair_nequip`` per-layer ghost exchange for multi-rank inference.
+
+        Unlike :meth:`enable_LAMMPSMLIAPGhostExchange`, the exchange is a registered custom
+        operator (``nequip_lammps::ghost_exchange``) rather than a Python ``autograd.Function``
+        calling into a ``lmp_data`` object, so the model can be compiled with AOTInductor for
+        the multi-rank ``pair_nequip`` target.
+        """
+
+        from ._ghost_exchange_pair import PairNequIPGhostExchangeModule
+
+        def factory(old):
+            new = PairNequIPGhostExchangeModule(
+                field=old.field,
+                irreps_in=old.irreps_in,
+            )
+            return new
+
+        return replace_submodules(model, cls, factory)
