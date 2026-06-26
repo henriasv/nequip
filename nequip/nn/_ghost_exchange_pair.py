@@ -75,20 +75,39 @@ except RuntimeError:
 class PairNequIPGhostExchangeModule(GhostExchangeModule):
     """Native ``pair_nequip`` per-layer ghost exchange via ``nequip_lammps::ghost_exchange``.
 
-    Mirrors :class:`LAMMPSMLIAPGhostExchangeModule` but (a) reads the owned/ghost atom counts
-    from ``NUM_LOCAL_GHOST_NODES_KEY`` (a plain integer-tensor input) rather than a Python
-    ``lmp_data`` object, and (b) performs the exchange through a registered custom operator so
-    it survives AOTInductor compilation.
+    Mirrors :class:`LAMMPSMLIAPGhostExchangeModule` but (a) takes the owned count as a *backed*
+    tensor dimension (``num_local_nodes_marker.shape[0]`` / the owned feature block) rather than
+    a Python ``lmp_data`` object, and (b) performs the exchange through a registered custom
+    operator so it survives AOTInductor compilation. The owned-only `[nlocal]` features are
+    re-expanded to `[ntotal]` with ``slice_scatter`` before the exchange (see ``forward``).
     """
 
     def forward(
         self, data: AtomicDataDict.Type, ghost_included: bool = False
     ) -> AtomicDataDict.Type:
-        # The feature tensor already spans all `ntotal` nodes (owned + ghost): every layer is
-        # computed on the full node set, so the exchange operates on the whole tensor in place.
-        # Owned rows are correct; ghost rows are overwritten here from their owners' values by
-        # the native pair style's `forward_comm`. Absent a LAMMPS comm context the op is the
-        # identity (single rank / ASE / export tracing). No owned/ghost split is read here, so
-        # the traced graph carries no data-dependent sizes and AOT-exports cleanly.
-        data[self.field] = torch.ops.nequip_lammps.ghost_exchange(data[self.field])
+        # Truncate-to-nlocal: the incoming features span only the `nlocal` owned nodes (every
+        # per-node op upstream was sliced to owned atoms). Re-expand them to `ntotal` so the
+        # native pair style's `forward_comm` can fill the ghost rows from their owners on
+        # neighboring ranks, ready for the TP-scatter that consumes the feature halo. Absent a
+        # LAMMPS comm context (single rank / ASE / export tracing) the op is the identity and
+        # the ghost rows stay zero — and since the single-rank case has `nghost == 0` the
+        # expansion is itself a no-op there.
+        node_features = data[self.field]
+        # `ntotal` from a never-truncated full-size node tensor (positions persist for forces).
+        ntotal = data[AtomicDataDict.POSITIONS_KEY].shape[0]
+        if ghost_included:
+            # already `ntotal`-wide: take the owned block (marker carries the backed `nlocal`)
+            nlocal = data[AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY].shape[0]
+            owned = node_features[:nlocal]
+        else:
+            owned = node_features
+        # Expand owned `[nlocal, F]` -> `[ntotal, F]` (ghost rows zero) via `slice_scatter`, NOT
+        # `cat` with a `(ntotal - nlocal, F)` zeros block. A `cat`/`zeros((ntotal-nlocal,))`
+        # triggers the 0/1 size specialization in `torch.export` and bakes a `nghost >= 1` (or
+        # `nghost <= 0`) guard, which then fails for either the single-rank correctness gate
+        # (`nghost == 0`) or multi-rank runs (`nghost > 0`). Scattering into an `ntotal`-sized
+        # buffer instead only defers a `nlocal <= ntotal` assert, satisfiable at both ends.
+        full = owned.new_zeros((ntotal,) + tuple(owned.shape[1:]))
+        full = torch.slice_scatter(full, owned, dim=0, start=0, end=owned.shape[0])
+        data[self.field] = torch.ops.nequip_lammps.ghost_exchange(full)
         return data

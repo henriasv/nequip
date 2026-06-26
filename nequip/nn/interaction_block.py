@@ -158,13 +158,18 @@ class InteractionBlock(GraphModuleMixin, torch.nn.Module):
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         if AtomicDataDict.LMP_MLIAP_DATA_KEY in data:
             num_local_nodes = self._get_mliap_num_local(data)
+        elif AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY in data:
+            # Native multi-rank `pair_nequip` (truncate-to-nlocal): the owned count is the
+            # size-0 of the marker input — a *backed* dynamic dim read as a tensor dimension,
+            # never via `.item()`, so it carries no data-dependent (unbacked) size and
+            # AOT-exports cleanly. Every per-node op below is then sliced to owned atoms only
+            # (cutting the redundant ghost-node compute of the all-`ntotal` formulation); the
+            # per-layer `ghost_exchange` re-expands owned features back to `ntotal` (filling
+            # ghost rows from their owners on other ranks) right before the TP-scatter.
+            num_local_nodes = data[AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY].shape[0]
         else:
-            # For native multi-rank `pair_nequip` this is `ntotal` (owned + ghost): every layer
-            # is computed on all nodes (the per-layer ghost exchange overwrites ghost features
-            # with their owners' values, so owned features are exact), and the owned-only energy
-            # reduction is enforced downstream in `AtomwiseReduce` by a guard-free owned mask.
-            # Keeping the backed `num_nodes` here means the traced graph has no data-dependent
-            # (unbacked) sizes and AOT-exports cleanly — identical code path to plain pair_nequip.
+            # Plain single-rank `pair_nequip` / ASE: no ghosts, so `nlocal == ntotal` and the
+            # truncations below are no-ops. Backed `num_nodes` keeps the graph export-clean.
             num_local_nodes = AtomicDataDict.num_nodes(data)
 
         x = data[AtomicDataDict.NODE_FEATURES_KEY]

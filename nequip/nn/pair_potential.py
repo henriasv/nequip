@@ -356,11 +356,13 @@ class ZBL(GraphModuleMixin, torch.nn.Module):
         data = with_edge_vectors_(data, with_lengths=True)
         edge_center = data[AtomicDataDict.EDGE_INDEX_KEY][0]
 
-        # account for possibility of reduced num nodes in atomic energy in a local-ghost atom context
-        if self.per_atom_energy_field in data:
-            num_nodes = data[self.per_atom_energy_field].size(0)
-        else:
-            num_nodes = AtomicDataDict.num_nodes(data)
+        # In a local-ghost (truncate-to-nlocal) context the per-atom energy field spans only the
+        # `nlocal` owned nodes, while `edge_center` still indexes ghost nodes up to `ntotal`.
+        # Scatter over ALL `ntotal` nodes (positions are never truncated), THEN truncate to the
+        # owned-node count before adding -- mirroring the conv stack's `tp_scatter(...); x[:nlocal]`.
+        # Scattering with `dim_size=nlocal` directly is an out-of-bounds write whenever an edge is
+        # centered on a ghost atom (edge_center >= nlocal).
+        ntotal = data[AtomicDataDict.POSITIONS_KEY].shape[0]
 
         zbl_edge_eng = self._zbl(
             Z=self.atomic_numbers,
@@ -379,10 +381,11 @@ class ZBL(GraphModuleMixin, torch.nn.Module):
             zbl_edge_eng,
             edge_center,
             dim=0,
-            dim_size=num_nodes,
+            dim_size=ntotal,
         )
         if self.per_atom_energy_field in data:
-            atomic_eng = atomic_eng + data[self.per_atom_energy_field]
+            nlocal = data[self.per_atom_energy_field].size(0)
+            atomic_eng = atomic_eng[:nlocal] + data[self.per_atom_energy_field]
         data[self.per_atom_energy_field] = atomic_eng
         return data
 
