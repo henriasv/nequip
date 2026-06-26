@@ -77,6 +77,26 @@ def aot_export_model(
         (*[data[k] for k in input_fields],),
         dynamic_shapes=dynamic_shapes,
     )
+    if os.environ.get("NEQUIP_DUMP_EXPORT", "0") == "1":
+        print("=== NEQUIP_DUMP_EXPORT: input_fields order ===", flush=True)
+        for i, f in enumerate(input_fields):
+            print(f"  [{i}] {f}: example shape {tuple(data[f].shape)} "
+                  f"dynamic_shapes={dynamic_shapes[i]}", flush=True)
+        print("=== placeholder symbolic shapes ===", flush=True)
+        for n in exported.graph.nodes:
+            if n.op == "placeholder":
+                v = n.meta.get("val", None)
+                print(f"  {n.name}: "
+                      f"{tuple(v.shape) if hasattr(v, 'shape') else v}", flush=True)
+        print("=== range_constraints ===", flush=True)
+        print(" ", exported.range_constraints, flush=True)
+        print("=== slice / sym_size nodes (size args reveal nlocal vs num_nodes) ===",
+              flush=True)
+        for n in exported.graph.nodes:
+            t = str(n.target)
+            if "slice" in t or "sym_size" in t or "slice_scatter" in t:
+                print(f"  {n.op} {n.name} = {t}{tuple(n.args)}", flush=True)
+        print("=== NEQUIP_DUMP_EXPORT end ===", flush=True)
     # NOTE: the following requires PyTorch 2.6
     out_path = torch._inductor.aoti_compile_and_package(
         exported,
