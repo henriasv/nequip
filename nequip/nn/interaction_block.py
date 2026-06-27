@@ -199,7 +199,15 @@ class InteractionBlock(GraphModuleMixin, torch.nn.Module):
         # because initial embedding include ghosts since atom types come with ghosts
         if not self.is_first_layer:
             data[AtomicDataDict.NODE_FEATURES_KEY] = x
-            data = self.ghost_exchange(data, ghost_included=False)
+            if "num_owned_edges_marker" in data:
+                # Async-overlap (M10 Stage 2): expand owned features to `ntotal` and record the
+                # "owned features ready" marker, but DEFER the halo `forward_comm` to `forward_finish`
+                # below — so the owned-source TP-scatter (which reads only owned features) runs while
+                # the halo is in flight. Ghost rows are zero here; the owned-source TP does not read
+                # them. Literal key (not the AtomicDataDict attribute): injection-safe under repack.
+                data = self.ghost_exchange.forward_start(data, ghost_included=False)
+            else:
+                data = self.ghost_exchange(data, ghost_included=False)
             x = data[AtomicDataDict.NODE_FEATURES_KEY]
 
         # === TP and scatter ===
@@ -220,6 +228,10 @@ class InteractionBlock(GraphModuleMixin, torch.nn.Module):
         # when this source is repacked into an older model whose AtomicDataDict lacks the attribute.
         if (not self.is_first_layer) and ("num_owned_edges_marker" in data):
             s = data["num_owned_edges_marker"].shape[0]
+            # Owned-source edges first: their TP-scatter reads only owned features `x[edge_src]`
+            # (`edge_src < nlocal`), available BEFORE the halo. This runs on the model stream while
+            # the deferred halo is still in flight (Stage 2: `forward_start` above issued no comm;
+            # `forward_finish` below completes it). `x` here is the `ntotal`-wide pre-halo tensor.
             x_owned = self.tp_scatter(
                 x=x,
                 edge_attr=edge_attr[:s],
@@ -227,6 +239,13 @@ class InteractionBlock(GraphModuleMixin, torch.nn.Module):
                 edge_dst=edge_dst[:s],
                 edge_src=edge_src[:s],
             )
+            # Complete the feature halo now (overlapped with `x_owned` above). After this `x` is the
+            # ghost-filled `ntotal` tensor; the ghost-source TP-scatter (`edge_src >= nlocal`) needs
+            # those rows. Splitting is exact (scatter is additive over edges; owned rows of the pre-
+            # and post-halo tensors are identical), so the sum reproduces the single-scatter result.
+            data[AtomicDataDict.NODE_FEATURES_KEY] = x
+            data = self.ghost_exchange.forward_finish(data, ghost_included=False)
+            x = data[AtomicDataDict.NODE_FEATURES_KEY]
             x_ghost = self.tp_scatter(
                 x=x,
                 edge_attr=edge_attr[s:],

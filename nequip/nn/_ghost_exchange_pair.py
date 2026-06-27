@@ -61,6 +61,41 @@ def _register_ghost_exchange_ops():
 
     ghost_exchange.register_autograd(_backward, setup_context=_setup_context)
 
+    # === M10 async-overlap split of the forward halo ===
+    # `ghost_exchange` does one blocking `Comm::forward_comm`. To hide that latency behind the
+    # owned-source TP-scatter (which needs only owned features, available before the halo), the
+    # async multi-rank target splits it into two registered ops the native pair style implements:
+    #   * `ghost_exchange_start(full)` -> records a "owned features ready" marker on the model
+    #     stream (before the owned-edge TP is launched) and returns `full` unchanged (ghost rows
+    #     still zero); no comm. Identity by default / single-rank.
+    #   * `ghost_exchange_finish(full)` -> runs the halo on the Kokkos comm stream (overlapping the
+    #     owned-edge TP still in flight on the model stream) and returns `full` with ghost rows
+    #     filled. Identity by default / single-rank.
+    # Both are functional (no in-place mutation), so AOT export + the in-model force/backward pass
+    # behave exactly like the single-op path. `finish`'s backward is the same reverse halo as
+    # `ghost_exchange`'s; `start`'s backward is the identity.
+    @torch.library.custom_op("nequip_lammps::ghost_exchange_start", mutates_args=())
+    def ghost_exchange_start(node_features: torch.Tensor) -> torch.Tensor:
+        return node_features.clone()
+
+    @ghost_exchange_start.register_fake
+    def _(node_features: torch.Tensor) -> torch.Tensor:
+        return torch.empty_like(node_features)
+
+    ghost_exchange_start.register_autograd(
+        lambda ctx, grad: grad, setup_context=_setup_context
+    )
+
+    @torch.library.custom_op("nequip_lammps::ghost_exchange_finish", mutates_args=())
+    def ghost_exchange_finish(node_features: torch.Tensor) -> torch.Tensor:
+        return node_features.clone()
+
+    @ghost_exchange_finish.register_fake
+    def _(node_features: torch.Tensor) -> torch.Tensor:
+        return torch.empty_like(node_features)
+
+    ghost_exchange_finish.register_autograd(_backward, setup_context=_setup_context)
+
 
 # Register once per process. Under ``torch.package`` framework code is imported inside an
 # isolated namespace, so this module can legitimately be imported more than once (the fork copy
@@ -112,4 +147,40 @@ class PairNequIPGhostExchangeModule(GhostExchangeModule):
         full = owned.new_zeros((ntotal,) + tuple(owned.shape[1:]))
         full = torch.slice_scatter(full, owned, dim=0, start=0, end=owned.shape[0])
         data[self.field] = torch.ops.nequip_lammps.ghost_exchange(full)
+        return data
+
+    def forward_start(
+        self, data: AtomicDataDict.Type, ghost_included: bool = False
+    ) -> AtomicDataDict.Type:
+        """M10 async forward halo, phase 1: expand owned features to ``ntotal`` and record the
+        "owned features ready" marker (no comm yet).
+
+        Mirrors the expand in :meth:`forward` but calls ``ghost_exchange_start`` instead of the
+        blocking ``ghost_exchange``: the ghost rows stay zero and the native pair style records a
+        stream event so :meth:`forward_finish` can begin the halo without waiting for the
+        owned-source TP-scatter that runs in between (the overlap). See ``interaction_block``.
+        """
+        node_features = data[self.field]
+        ntotal = data[AtomicDataDict.POSITIONS_KEY].shape[0]
+        if ghost_included:
+            nlocal = data["num_local_nodes_marker"].shape[0]
+            owned = node_features[:nlocal]
+        else:
+            owned = node_features
+        full = owned.new_zeros((ntotal,) + tuple(owned.shape[1:]))
+        full = torch.slice_scatter(full, owned, dim=0, start=0, end=owned.shape[0])
+        data[self.field] = torch.ops.nequip_lammps.ghost_exchange_start(full)
+        return data
+
+    def forward_finish(
+        self, data: AtomicDataDict.Type, ghost_included: bool = False
+    ) -> AtomicDataDict.Type:
+        """M10 async forward halo, phase 2: complete the halo (fill ghost rows).
+
+        ``data[field]`` is the ``ntotal``-wide tensor from :meth:`forward_start` (owned rows valid,
+        ghost rows zero). ``ghost_exchange_finish`` runs the per-layer ``Comm::forward_comm`` on
+        the Kokkos comm stream and returns it with the ghost rows filled, ready for the
+        ghost-source TP-scatter.
+        """
+        data[self.field] = torch.ops.nequip_lammps.ghost_exchange_finish(data[self.field])
         return data

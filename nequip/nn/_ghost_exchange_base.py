@@ -29,6 +29,23 @@ class GhostExchangeModule(GraphModuleMixin, torch.nn.Module):
     ) -> AtomicDataDict.Type:
         raise NotImplementedError("Subclasses must implement forward method")
 
+    def forward_start(
+        self,
+        data: AtomicDataDict.Type,
+        ghost_included: bool = False,
+    ) -> AtomicDataDict.Type:
+        # M10 async forward halo, phase 1 (default: no-op / identity). Overridden by the native
+        # pair_nequip exchange; only reached on the async multi-rank path.
+        return data
+
+    def forward_finish(
+        self,
+        data: AtomicDataDict.Type,
+        ghost_included: bool = False,
+    ) -> AtomicDataDict.Type:
+        # M10 async forward halo, phase 2 (default: no-op / identity).
+        return data
+
 
 class NoOpGhostExchangeModule(GhostExchangeModule):
     """Base ghost exchange module that performs a no-op."""
