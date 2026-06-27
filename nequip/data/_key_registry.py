@@ -18,6 +18,7 @@ _DEFAULT_LONG_FIELDS: Set[str] = {
     _keys.NUM_NODES_KEY,
     _keys.NUM_LOCAL_GHOST_NODES_KEY,
     _keys.NUM_LOCAL_NODES_MARKER_KEY,
+    _keys.NUM_OWNED_EDGES_MARKER_KEY,
     _keys.DATASET_KEY,
     _keys.TOTAL_CHARGE_KEY,
     _keys.TOTAL_SPIN_KEY,
@@ -36,6 +37,10 @@ _DEFAULT_GRAPH_FIELDS: Set[str] = {
     # `nequip_make_fx`'s second trace) must copy it untouched rather than apply a `num_nodes`
     # mask. Its single dim is special-cased to the `nlocal` dynamic dim in `get_dynamic_shapes`.
     _keys.NUM_LOCAL_NODES_MARKER_KEY,
+    # `num_owned_edges_marker` is likewise graph-typed (it has `num_owned_src_edges` rows, not
+    # `num_nodes`/`num_edges` rows); its single dim is special-cased to the `nowned_edges`
+    # dynamic dim in `get_dynamic_shapes`.
+    _keys.NUM_OWNED_EDGES_MARKER_KEY,
     _keys.DATASET_KEY,
     _keys.TOTAL_CHARGE_KEY,
     _keys.TOTAL_SPIN_KEY,
@@ -240,6 +245,14 @@ def get_dynamic_shapes(input_fields, batch_map):
         # target supplies this field (and an "nlocal" entry in `batch_map`).
         if field == _keys.NUM_LOCAL_NODES_MARKER_KEY:
             dynamic_shapes += ({0: batch_map["nlocal"]},)
+            continue
+        # special case the owned-src-edge marker `(num_owned_src_edges,)`: its single dim is the
+        # dedicated `nowned_edges` dynamic dim (distinct from `edge`==total edges), so the
+        # async-overlap reformulation can slice the per-edge tensors at a *backed* owned count.
+        # Only the async multi-rank `pair_nequip` target supplies this field (and a
+        # "nowned_edges" entry in `batch_map`).
+        if field == _keys.NUM_OWNED_EDGES_MARKER_KEY:
+            dynamic_shapes += ({0: batch_map["nowned_edges"]},)
             continue
         field_type = get_field_type(field, error_on_unregistered=False)
         if field_type is not None:

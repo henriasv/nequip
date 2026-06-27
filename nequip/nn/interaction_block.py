@@ -203,13 +203,46 @@ class InteractionBlock(GraphModuleMixin, torch.nn.Module):
             x = data[AtomicDataDict.NODE_FEATURES_KEY]
 
         # === TP and scatter ===
-        x = self.tp_scatter(
-            x=x,
-            edge_attr=data[AtomicDataDict.EDGE_ATTRS_KEY],
-            edge_weight=self.edge_mlp(data[AtomicDataDict.EDGE_EMBEDDING_KEY]),
-            edge_dst=data[AtomicDataDict.EDGE_INDEX_KEY][0],
-            edge_src=data[AtomicDataDict.EDGE_INDEX_KEY][1],
-        )
+        edge_attr = data[AtomicDataDict.EDGE_ATTRS_KEY]
+        edge_weight = self.edge_mlp(data[AtomicDataDict.EDGE_EMBEDDING_KEY])
+        edge_dst = data[AtomicDataDict.EDGE_INDEX_KEY][0]
+        edge_src = data[AtomicDataDict.EDGE_INDEX_KEY][1]
+
+        # Async-overlap edge split (M10): on non-first layers of the async multi-rank target the
+        # native pair style emits the edge list owned-source-first (edges with `edge_src < nlocal`)
+        # and supplies `num_owned_edges_marker` whose dim-0 is the *backed* count of those edges.
+        # The owned-source TP-scatter needs only owned features `x[edge_src]` — available BEFORE the
+        # feature halo arrives — so it can run while the halo is in flight (the overlap is wired in
+        # Stage 2; here the `ghost_exchange` above is still blocking). Splitting is exact: `scatter`
+        # is additive over edges and both calls share the same `x` (hence the same `dim_size`), so
+        # `tp_scatter(owned) + tp_scatter(ghost)` equals one scatter over all edges up to scatter-add
+        # reassociation. Literal key (not AtomicDataDict.NUM_OWNED_EDGES_MARKER_KEY): injection-safe
+        # when this source is repacked into an older model whose AtomicDataDict lacks the attribute.
+        if (not self.is_first_layer) and ("num_owned_edges_marker" in data):
+            s = data["num_owned_edges_marker"].shape[0]
+            x_owned = self.tp_scatter(
+                x=x,
+                edge_attr=edge_attr[:s],
+                edge_weight=edge_weight[:s],
+                edge_dst=edge_dst[:s],
+                edge_src=edge_src[:s],
+            )
+            x_ghost = self.tp_scatter(
+                x=x,
+                edge_attr=edge_attr[s:],
+                edge_weight=edge_weight[s:],
+                edge_dst=edge_dst[s:],
+                edge_src=edge_src[s:],
+            )
+            x = x_owned + x_ghost
+        else:
+            x = self.tp_scatter(
+                x=x,
+                edge_attr=edge_attr,
+                edge_weight=edge_weight,
+                edge_dst=edge_dst,
+                edge_src=edge_src,
+            )
         x = x[:num_local_nodes]
 
         x = self.linear_2(x)

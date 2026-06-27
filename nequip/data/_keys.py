@@ -123,6 +123,17 @@ NUM_LOCAL_GHOST_NODES_KEY: Final[str] = "num_local_ghost_atoms"
 # data-dependent (unbacked) guard wall. Contents are irrelevant — only the size-0 dim is used.
 NUM_LOCAL_NODES_MARKER_KEY: Final[str] = "num_local_nodes_marker"
 
+# === native multi-rank `pair_nequip` async-overlap edge-split key ===
+# A rank-1 marker tensor of shape ``(num_owned_src_edges,)`` whose ONLY purpose is to carry the
+# count of owned-source edges (those with ``edge_index[1] < nlocal``) as a *backed* dynamic
+# dimension (`marker.shape[0]`), distinct from the `edge` (== total edges) dimension. The native
+# pair style emits the edge list owned-source-first; the async-overlap reformulation slices the
+# per-edge tensors at this count so the owned-source TP-scatter (which needs no freshly-exchanged
+# ghost rows) can run while the feature halo is in flight. Reading the count as a tensor
+# *dimension* (not a `.item()` value) keeps it a backed symint, so `torch.export`/AOTInductor
+# never hits the data-dependent (unbacked) guard wall. Contents are irrelevant — only the dim.
+NUM_OWNED_EDGES_MARKER_KEY: Final[str] = "num_owned_edges_marker"
+
 # make a list of allowed keys
 ALLOWED_KEYS: List[str] = [v for k, v in globals().items() if k.endswith("_KEY")]
 # check that the fields don't have "." (to avoid clashes with nn parameter names)

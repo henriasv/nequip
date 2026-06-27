@@ -80,6 +80,12 @@ class GraphModel(GraphModuleMixin, torch.nn.Module):
             # source is repacked by `nequip-compile`'s auto-rebundle into OLDER models whose
             # bundled AtomicDataDict predates that attribute -- the literal stays injection-safe.
             "num_local_nodes_marker": None,
+            # native multi-rank `pair_nequip` async-overlap owned-src-edge marker -- whitelisted
+            # here (literal key, same injection-safety rationale) so it survives the input filter
+            # and reaches InteractionBlock, which slices the per-edge tensors at `marker.shape[0]`
+            # to overlap the owned-source TP-scatter with the in-flight feature halo. Absent (the
+            # default / non-async targets) every layer uses the single (unsplit) TP-scatter path.
+            "num_owned_edges_marker": None,
         }
         model_input_fields = AtomicDataDict._fix_irreps_dict(model_input_fields)
         irreps_in.update(model_input_fields)
@@ -170,4 +176,9 @@ class GraphModel(GraphModuleMixin, torch.nn.Module):
         # into an older model whose bundled AtomicDataDict lacks NUM_LOCAL_NODES_MARKER_KEY.
         if "num_local_nodes_marker" in data:
             new_data["num_local_nodes_marker"] = data["num_local_nodes_marker"]
+        # async-overlap owned-src-edge marker: passed through for the same reason (a loaded
+        # model's saved `model_input_fields` would otherwise filter it out and every layer would
+        # fall back to the unsplit TP-scatter path). Literal key keeps it injection-safe.
+        if "num_owned_edges_marker" in data:
+            new_data["num_owned_edges_marker"] = data["num_owned_edges_marker"]
         return self.model(new_data)

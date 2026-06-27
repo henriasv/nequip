@@ -5,6 +5,7 @@ from ._workflow_utils import set_workflow_state
 from ._compile_utils import (
     COMPILE_TARGET_DICT,
     AOTI_PAIR_NEQUIP_MULTIRANK_TARGET,
+    AOTI_PAIR_NEQUIP_MULTIRANK_ASYNC_TARGET,
 )
 from nequip.model.utils import _EAGER_MODEL_KEY
 from nequip.model.saved_models.load_utils import load_saved_model
@@ -74,6 +75,15 @@ def _parse_bounds_to_Dim(name: str, bounds_str: str):
 # pickled instances really have. See `nequip/nn/_ghost_exchange_pair.py`.
 _PAIR_NEQUIP_MULTIRANK_MODIFIER: Final[str] = "enable_PairNequIPGhostExchange"
 _PAIR_NEQUIP_MULTIRANK_META_KEY: Final[str] = "pair_nequip_multirank"
+# stamped (in addition to the multirank key) for the async-overlap target; the native pair style
+# reads it to decide whether to partition the edge list owned-src-first and feed the edge marker.
+_PAIR_NEQUIP_ASYNC_META_KEY: Final[str] = "pair_nequip_multirank_async"
+# the async target is part of the multirank family (same truncate-to-nlocal bundled nn + the same
+# `enable_PairNequIPGhostExchange` exchange op); it only adds the owned-src-edge split on top.
+_MULTIRANK_FAMILY_TARGETS: Final[tuple] = (
+    AOTI_PAIR_NEQUIP_MULTIRANK_TARGET,
+    AOTI_PAIR_NEQUIP_MULTIRANK_ASYNC_TARGET,
+)
 # nn source files that carry the truncate-to-nlocal / marker plumbing (validated repack set)
 _MULTIRANK_NN_FILES: Final[tuple] = (
     "_ghost_exchange_base.py",
@@ -86,6 +96,10 @@ _MULTIRANK_NN_FILES: Final[tuple] = (
 # literal marker key the patched nn references (the bundled AtomicDataDict predates the
 # `NUM_LOCAL_NODES_MARKER_KEY` attribute, so the patched source keys it by this string)
 _MULTIRANK_SENTINEL: Final[str] = "num_local_nodes_marker"
+# async-overlap sentinel: the owned-src-edge split references this literal in the bundled
+# `interaction_block.py`. A bundle can be multirank-capable yet lack the async split, so the
+# async target checks for THIS sentinel to decide whether to (re)inject the async overlay.
+_ASYNC_SENTINEL: Final[str] = "num_owned_edges_marker"
 # Shipped model-era overlay: the validated truncate-to-nlocal `nn` source set used for the
 # re-bundle (see the block above for why a *model-era* — not installed — source is required).
 # Resolution: `$NEQUIP_MULTIRANK_PKGSRC` then the baked container default. Absent/partial ->
@@ -111,13 +125,14 @@ def _multirank_overlay_dir():
     return None
 
 
-def _bundle_is_multirank_capable(zip_path) -> bool:
-    """Whether a packaged model's bundled ``nn`` already carries truncate-to-nlocal support.
+def _bundle_is_multirank_capable(zip_path, sentinel: str = _MULTIRANK_SENTINEL) -> bool:
+    """Whether a packaged model's bundled ``nn`` already carries the required support.
 
-    Detected by the ``num_local_nodes_marker`` sentinel in the bundled
-    ``interaction_block.py``. Returns ``True`` (i.e. skip the re-bundle) if the package
-    cannot be inspected in the expected layout — refreshing a non-standard package would be
-    unsafe, and the pair style's runtime multi-rank guard is the backstop.
+    Detected by ``sentinel`` in the bundled ``interaction_block.py`` (the truncate-to-nlocal
+    marker for the plain multi-rank target, or the owned-src-edge-split marker for the async
+    target — a bundle can carry the former but not the latter). Returns ``True`` (i.e. skip the
+    re-bundle) if the package cannot be inspected in the expected layout — refreshing a
+    non-standard package would be unsafe, and the pair style's runtime guard is the backstop.
     """
     import zipfile
 
@@ -130,7 +145,7 @@ def _bundle_is_multirank_capable(zip_path) -> bool:
             ]
             if not hits:
                 return True
-            return _MULTIRANK_SENTINEL in zf.read(hits[0]).decode("utf-8", "replace")
+            return sentinel in zf.read(hits[0]).decode("utf-8", "replace")
     except (zipfile.BadZipFile, OSError):
         return True
 
@@ -158,7 +173,7 @@ def _maybe_rebundle_multirank(input_path, mode, target, modifiers):
     # The multi-GPU path is the dedicated `pair_nequip_multirank` target (it declares the
     # `num_local_ghost_atoms` / `num_local_nodes_marker` runtime inputs that the single-rank
     # `pair_nequip` target does not). Only that target needs the truncate-to-nlocal bundled nn.
-    if mode != "aotinductor" or target != AOTI_PAIR_NEQUIP_MULTIRANK_TARGET:
+    if mode != "aotinductor" or target not in _MULTIRANK_FAMILY_TARGETS:
         return input_path
     if _PAIR_NEQUIP_MULTIRANK_MODIFIER not in (modifiers or []):
         return input_path
@@ -169,10 +184,18 @@ def _maybe_rebundle_multirank(input_path, mode, target, modifiers):
         # bundled code is stale the pair style's runtime multi-rank guard reports it.
         return input_path
 
-    if _bundle_is_multirank_capable(p):
+    # async target needs the owned-src-edge split in the bundled nn, which a plain multirank
+    # bundle lacks — check for the async sentinel so such a bundle still gets the async overlay.
+    _sentinel = (
+        _ASYNC_SENTINEL
+        if target == AOTI_PAIR_NEQUIP_MULTIRANK_ASYNC_TARGET
+        else _MULTIRANK_SENTINEL
+    )
+    if _bundle_is_multirank_capable(p, _sentinel):
         logger.info(
-            "pair_nequip multirank: bundled nequip.nn already supports truncate-to-nlocal; "
-            "no re-bundle needed."
+            "pair_nequip multirank: bundled nequip.nn already carries the required support "
+            "(%s); no re-bundle needed.",
+            _sentinel,
         )
         return input_path
 
@@ -429,8 +452,13 @@ def main(args=None):
     # inputs. Stamping on the modifier alone produced a single-rank `.pt2` (target `pair_nequip`)
     # carrying `pair_nequip_multirank=1`, which the pair style flagged as metadata/input
     # disagreement. The declared `num_local_ghost_atoms` input remains the authoritative signal.
-    if args.target == AOTI_PAIR_NEQUIP_MULTIRANK_TARGET:
+    if args.target in _MULTIRANK_FAMILY_TARGETS:
         metadata[_PAIR_NEQUIP_MULTIRANK_META_KEY] = "1"
+    # additionally stamp the async-overlap key for the async target: the pair style reads it to
+    # partition the edge list owned-src-first and feed `num_owned_edges_marker`. A multirank model
+    # WITHOUT this key takes the unsplit TP-scatter path (no marker fed) — both coexist.
+    if args.target == AOTI_PAIR_NEQUIP_MULTIRANK_ASYNC_TARGET:
+        metadata[_PAIR_NEQUIP_ASYNC_META_KEY] = "1"
 
     logger.debug(model)
 

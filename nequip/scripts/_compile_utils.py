@@ -8,6 +8,11 @@ from typing import Dict, List, Callable, Union
 
 AOTI_PAIR_NEQUIP_TARGET = "pair_nequip"
 AOTI_PAIR_NEQUIP_MULTIRANK_TARGET = "pair_nequip_multirank"
+# async-overlap variant of the multi-rank target: additionally takes a `num_owned_edges_marker`
+# so the per-layer TP-scatter is split owned-src / ghost-src and the owned part overlaps the
+# in-flight feature halo (M10). Distinct target so the default `-auto` multirank model is
+# unaffected; the native pair style feeds the marker only for `.pt2`s built from this target.
+AOTI_PAIR_NEQUIP_MULTIRANK_ASYNC_TARGET = "pair_nequip_multirank_async"
 AOTI_ASE_TARGET = "ase"
 AOTI_BATCH_TARGET = "batch"
 
@@ -27,6 +32,13 @@ PAIR_NEQUIP_INPUTS = [
 PAIR_NEQUIP_MULTIRANK_INPUTS = PAIR_NEQUIP_INPUTS + [
     AtomicDataDict.NUM_LOCAL_GHOST_NODES_KEY,
     AtomicDataDict.NUM_LOCAL_NODES_MARKER_KEY,
+]
+
+# async-overlap multi-rank target: the multi-rank inputs plus a `(num_owned_src_edges,)` marker
+# whose dim-0 carries the *backed* owned-source-edge count that the per-layer TP-scatter split
+# slices on (owned-src edges first in the pair style's edge list).
+PAIR_NEQUIP_MULTIRANK_ASYNC_INPUTS = PAIR_NEQUIP_MULTIRANK_INPUTS + [
+    AtomicDataDict.NUM_OWNED_EDGES_MARKER_KEY,
 ]
 
 BATCH_INPUTS = PAIR_NEQUIP_INPUTS + [
@@ -108,6 +120,47 @@ def single_frame_pair_nequip_multirank_data_settings(data):
     return data
 
 
+def single_frame_pair_nequip_multirank_async_batch_map_settings(batch_map):
+    # multi-rank settings (graph static + `nlocal` dyn dim), plus a dedicated `nowned_edges`
+    # dynamic dim for the owned-src-edge marker, independent of `edge` (== total edges). The
+    # relation `nowned_edges <= edge` is not declared here; the per-edge slice ops (`[:s]`/`[s:]`)
+    # impose it as a deferred runtime assert during export, satisfiable for any split.
+    batch_map = single_frame_pair_nequip_multirank_batch_map_settings(batch_map)
+    batch_map["nowned_edges"] = torch.export.dynamic_shapes.Dim(
+        "nowned_edges", min=1, max=torch.inf
+    )
+    # The owned/ghost split slices `edge_*[:s]` and `edge_*[s:]`; export needs BOTH halves to
+    # dodge the 0/1 size specialization, which forces `num_edges >= 4` (each half >= 2 with the
+    # example's `n_owned = n_edges // 2`). Bump the `edge` dim's lower bound accordingly (keep any
+    # higher user-set min / finite max). Real runs have thousands of edges, so this never binds.
+    edge_dim = batch_map.get("edge")
+    if edge_dim is not None and edge_dim is not torch.export.Dim.STATIC:
+        cur_min = int(getattr(edge_dim, "min", 0) or 0)
+        cur_max = getattr(edge_dim, "max", torch.inf)
+        if cur_min < 4:
+            batch_map["edge"] = torch.export.dynamic_shapes.Dim(
+                "num_edges", min=4, max=cur_max
+            )
+    return batch_map
+
+
+def single_frame_pair_nequip_multirank_async_data_settings(data):
+    # multi-rank settings (sets `num_local_ghost_atoms` + `num_local_nodes_marker`), plus the
+    # async owned-src-edge marker. CRUCIAL: the example MUST have BOTH `nghost > 0` (so the node
+    # `nlocal`/`ntotal` dims stay independent — see the multi-rank note) AND a split strictly
+    # inside the edge list (`0 < nowned < nedges`) so the `nowned_edges` and `edge` dims stay
+    # independent and export does not specialize either sub-list away. Example values are
+    # otherwise physically irrelevant (the AOT-vs-eager check only needs self-consistency).
+    data = single_frame_pair_nequip_multirank_data_settings(data)
+    device = data[AtomicDataDict.POSITIONS_KEY].device
+    n_edges = data[AtomicDataDict.EDGE_INDEX_KEY].shape[1]
+    n_owned = max(1, n_edges // 2)
+    data[AtomicDataDict.NUM_OWNED_EDGES_MARKER_KEY] = torch.zeros(
+        n_owned, dtype=torch.int64, device=device
+    )
+    return data
+
+
 def batched_data_settings(data):
     assert AtomicDataDict.BATCH_KEY in data
     assert AtomicDataDict.NUM_NODES_KEY in data
@@ -128,6 +181,12 @@ PAIR_NEQUIP_MULTIRANK_TARGET = {
     "batch_map_settings": single_frame_pair_nequip_multirank_batch_map_settings,
     "data_settings": single_frame_pair_nequip_multirank_data_settings,
 }
+PAIR_NEQUIP_MULTIRANK_ASYNC_TARGET = {
+    "input": PAIR_NEQUIP_MULTIRANK_ASYNC_INPUTS,
+    "output": LMP_OUTPUTS,
+    "batch_map_settings": single_frame_pair_nequip_multirank_async_batch_map_settings,
+    "data_settings": single_frame_pair_nequip_multirank_async_data_settings,
+}
 ASE_TARGET = {
     "input": PAIR_NEQUIP_INPUTS,
     "output": ASE_OUTPUTS,
@@ -144,6 +203,7 @@ BATCH_TARGET = {
 COMPILE_TARGET_DICT = {
     AOTI_PAIR_NEQUIP_TARGET: PAIR_NEQUIP_TARGET,
     AOTI_PAIR_NEQUIP_MULTIRANK_TARGET: PAIR_NEQUIP_MULTIRANK_TARGET,
+    AOTI_PAIR_NEQUIP_MULTIRANK_ASYNC_TARGET: PAIR_NEQUIP_MULTIRANK_ASYNC_TARGET,
     AOTI_ASE_TARGET: ASE_TARGET,
     AOTI_BATCH_TARGET: BATCH_TARGET,
 }
