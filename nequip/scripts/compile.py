@@ -192,22 +192,30 @@ def _maybe_rebundle_multirank(input_path, mode, target, modifiers):
     if tmp_out.exists():
         tmp_out.unlink()
     overlay = _multirank_overlay_dir()
+    if overlay is not None:
+        # Explicit override: a validated model-era overlay pinned via $NEQUIP_MULTIRANK_PKGSRC
+        # (or the baked default). Used as-is.
+        src_desc = f"the pinned overlay (${_MULTIRANK_OVERLAY_ENV} / default: {overlay})"
+    else:
+        # Default (version-robust): DERIVE an era-matched overlay from the package's OWN bundled nn
+        # + the bounded additive multirank grafts (marker / ghost-exchange / OEQ-embed / owned-only
+        # atomwise+ZBL). Keeps the model's own norm / ZBL / imports, so it is attribute-safe AND
+        # import-safe by construction and works regardless of the package's nequip era — unlike
+        # injecting a fixed-era or installed `nn` over the model's frozen instances (unbounded
+        # missing-attribute whack-a-mole). See `_multirank_graft`.
+        from ._multirank_graft import derive_multirank_overlay
+
+        overlay = derive_multirank_overlay(
+            p,
+            prefix,
+            _MULTIRANK_NN_FILES,
+            p.with_name(p.name[: -len(".nequip.zip")] + ".mrt-overlay"),
+        )
+        src_desc = "the package's own bundled nn + additive multirank grafts (derived)"
     replace_args = []
     for f in _MULTIRANK_NN_FILES:
-        if overlay is not None:
-            # 2-arg `--replace <archive_member> <local_file>`: inject the shipped *model-era*
-            # overlay so the refreshed bundle stays compatible with older pickled instances.
-            replace_args += ["--replace", f"{prefix}/nequip/nn/{f}", str(overlay / f)]
-        else:
-            # 1-arg fallback: auto-resolve from the *installed* nequip. Correct only when the
-            # model's bundled nn matches the installed era; otherwise `update`'s prediction
-            # verification (or the first forward) fails and we surface re-export guidance below.
-            replace_args += ["--replace", f"{prefix}/nequip/nn/{f}"]
-    src_desc = (
-        f"the shipped model-era overlay ({overlay})"
-        if overlay is not None
-        else "the installed nequip (no overlay found)"
-    )
+        # 2-arg `--replace <archive_member> <local_file>`: inject the era-matched overlay file.
+        replace_args += ["--replace", f"{prefix}/nequip/nn/{f}", str(overlay / f)]
     logger.warning(
         "pair_nequip multirank: bundled nequip.nn predates truncate-to-nlocal; re-bundling "
         "%s from %s (%d nn files) -> %s (predictions verified unchanged).",
