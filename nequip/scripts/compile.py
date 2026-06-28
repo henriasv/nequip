@@ -179,10 +179,9 @@ def _maybe_rebundle_multirank(input_path, mode, target, modifiers):
     prefix = _multirank_zip_prefix(p)
     if prefix is None:
         logger.warning(
-            "pair_nequip multirank: could not find `nequip/nn/` inside %s to re-bundle; "
-            "proceeding as-is. If this is a packaged NequIP model, re-bundle it manually "
-            "with `nequip-package update` (see the multi-GPU pair_nequip docs).",
-            input_path,
+            f"pair_nequip multirank: could not find `nequip/nn/` inside {input_path} to "
+            f"re-bundle; proceeding as-is. If this is a packaged NequIP model, re-bundle it "
+            f"manually with `nequip-package update` (see the multi-GPU pair_nequip docs)."
         )
         return input_path
 
@@ -216,13 +215,13 @@ def _maybe_rebundle_multirank(input_path, mode, target, modifiers):
     for f in _MULTIRANK_NN_FILES:
         # 2-arg `--replace <archive_member> <local_file>`: inject the era-matched overlay file.
         replace_args += ["--replace", f"{prefix}/nequip/nn/{f}", str(overlay / f)]
+    # Pre-format (f-string), do NOT pass lazy %-args: RankedLogger swallows the first positional
+    # after the message (its `rank` slot), which shifts %-args and raises a spurious
+    # "%d format: a real number is required, not str" logging error (the compile still succeeds).
     logger.warning(
-        "pair_nequip multirank: bundled nequip.nn predates truncate-to-nlocal; re-bundling "
-        "%s from %s (%d nn files) -> %s (predictions verified unchanged).",
-        p.name,
-        src_desc,
-        len(_MULTIRANK_NN_FILES),
-        tmp_out.name,
+        f"pair_nequip multirank: bundled nequip.nn predates truncate-to-nlocal; re-bundling "
+        f"{p.name} from {src_desc} ({len(_MULTIRANK_NN_FILES)} nn files) -> {tmp_out.name} "
+        f"(predictions verified unchanged)."
     )
     try:
         _package_main(["update", str(p), str(tmp_out), *replace_args])
@@ -394,20 +393,34 @@ def main(args=None):
             "`output-path` must end with the `.nequip.pt2` extension for `aotinductor` compile mode"
         )
 
-    # Self-correcting guard for the most common multi-GPU mistake: the multirank ghost-exchange
-    # modifier is supplied by the multirank rebundle overlay and is only meaningful for the
-    # `pair_nequip_multirank` target. Caught here it yields a clear, actionable message instead of
-    # the generic "<modifier> is not a registered model modifier" failure further down.
-    if _PAIR_NEQUIP_MULTIRANK_MODIFIER in (args.modifiers or []) and (
-        args.target != AOTI_PAIR_NEQUIP_MULTIRANK_TARGET
-    ):
+    # The multirank ghost-exchange modifier is mandatory-and-1:1-coupled to the
+    # `pair_nequip_multirank` target: a multirank model without it has no cross-rank message
+    # passing (wrong forces beyond 1 rank), and the modifier is meaningless for any other target
+    # (it is supplied by the multirank rebundle overlay, not registered in the installed nequip).
+    # So it is not a user-facing choice -- the target implies it.
+    if args.target == AOTI_PAIR_NEQUIP_MULTIRANK_TARGET:
+        # Auto-apply for the multirank target so users never have to know about it. Prepend (when
+        # absent) to preserve the validated `[ghost_exchange, OpenEquivariance, ...]` ordering;
+        # idempotent if the user passed it explicitly.
+        mods = list(args.modifiers or [])
+        if _PAIR_NEQUIP_MULTIRANK_MODIFIER not in mods:
+            mods.insert(0, _PAIR_NEQUIP_MULTIRANK_MODIFIER)
+            logger.info(
+                f"`--target {AOTI_PAIR_NEQUIP_MULTIRANK_TARGET}` implies "
+                f"`{_PAIR_NEQUIP_MULTIRANK_MODIFIER}`; applying it automatically."
+            )
+        args.modifiers = mods
+    elif _PAIR_NEQUIP_MULTIRANK_MODIFIER in (args.modifiers or []):
+        # Self-correcting guard for the remaining mistake: the modifier passed with a non-multirank
+        # target. Clear, actionable message instead of the generic "<modifier> is not a registered
+        # model modifier" failure further down.
         raise ValueError(
             f"`{_PAIR_NEQUIP_MULTIRANK_MODIFIER}` is only valid with "
             f"`--target {AOTI_PAIR_NEQUIP_MULTIRANK_TARGET}` (it is provided by the multi-rank "
             f"rebundle overlay, not a registered modifier of the installed nequip) — you passed "
             f"`--target {args.target}`. For the multi-GPU build re-run with "
-            f"`--target {AOTI_PAIR_NEQUIP_MULTIRANK_TARGET}`; for a single-rank `pair_nequip` build "
-            f"drop the modifier."
+            f"`--target {AOTI_PAIR_NEQUIP_MULTIRANK_TARGET}` (which applies it for you); for a "
+            f"single-rank `pair_nequip` build drop the modifier."
         )
 
     # === pair_nequip multirank: auto-refresh stale bundled nn (see helper above) ===
