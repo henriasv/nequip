@@ -394,6 +394,22 @@ def main(args=None):
             "`output-path` must end with the `.nequip.pt2` extension for `aotinductor` compile mode"
         )
 
+    # Self-correcting guard for the most common multi-GPU mistake: the multirank ghost-exchange
+    # modifier is supplied by the multirank rebundle overlay and is only meaningful for the
+    # `pair_nequip_multirank` target. Caught here it yields a clear, actionable message instead of
+    # the generic "<modifier> is not a registered model modifier" failure further down.
+    if _PAIR_NEQUIP_MULTIRANK_MODIFIER in (args.modifiers or []) and (
+        args.target != AOTI_PAIR_NEQUIP_MULTIRANK_TARGET
+    ):
+        raise ValueError(
+            f"`{_PAIR_NEQUIP_MULTIRANK_MODIFIER}` is only valid with "
+            f"`--target {AOTI_PAIR_NEQUIP_MULTIRANK_TARGET}` (it is provided by the multi-rank "
+            f"rebundle overlay, not a registered modifier of the installed nequip) — you passed "
+            f"`--target {args.target}`. For the multi-GPU build re-run with "
+            f"`--target {AOTI_PAIR_NEQUIP_MULTIRANK_TARGET}`; for a single-rank `pair_nequip` build "
+            f"drop the modifier."
+        )
+
     # === pair_nequip multirank: auto-refresh stale bundled nn (see helper above) ===
     args.input_path = _maybe_rebundle_multirank(
         args.input_path, args.mode, args.target, args.modifiers
