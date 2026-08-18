@@ -31,8 +31,10 @@ nequip-compile \
   path/to/compiled_model.nequip.pt2 \
   --device [cpu|cuda] \
   --mode aotinductor \
-  --target [pair_nequip|pair_allegro]
+  --target [pair_nequip|pair_nequip_multirank|pair_allegro]
 ```
+
+The `pair_nequip_multirank` target produces a NequIP model that runs across multiple MPI ranks and GPUs; see [Multi-GPU `pair_nequip`](multirank.md).
 
 ## Installation and Usage
 
