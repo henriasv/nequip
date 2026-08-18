@@ -74,6 +74,9 @@ def _parse_bounds_to_Dim(name: str, bounds_str: str):
 # pickled instances really have. See `nequip/nn/_ghost_exchange_pair.py`.
 _PAIR_NEQUIP_MULTIRANK_MODIFIER: Final[str] = "enable_PairNequIPGhostExchange"
 _PAIR_NEQUIP_MULTIRANK_META_KEY: Final[str] = "pair_nequip_multirank"
+# widest flattened per-node feature width (doubles/atom) crossing the ghost exchange;
+# read by the pair style to size LAMMPS comm buffers exactly
+_PAIR_NEQUIP_FEATURE_WIDTH_META_KEY: Final[str] = "pair_nequip_feature_width"
 # nn source files that carry the truncate-to-nlocal / marker plumbing (validated repack set)
 _MULTIRANK_NN_FILES: Final[tuple] = (
     "_ghost_exchange_base.py",
@@ -468,6 +471,31 @@ def main(args=None):
     # disagreement. The declared `num_local_ghost_atoms` input remains the authoritative signal.
     if args.target == AOTI_PAIR_NEQUIP_MULTIRANK_TARGET:
         metadata[_PAIR_NEQUIP_MULTIRANK_META_KEY] = "1"
+        # Stamp the widest per-node feature width (flattened scalar count) the per-layer
+        # ghost exchange will ever move, so the pair style can size its LAMMPS comm buffers
+        # exactly (Comm allocates them before the first compute and never grows them for
+        # pair-initiated comm). Walk by class NAME, not isinstance: for a repackaged model
+        # the exchange modules come from the package's own bundled source, which is a
+        # different class object than the installed one.
+        feat_width = 0
+        for m in model.modules():
+            if type(m).__name__ == "PairNequIPGhostExchangeModule":
+                irreps = getattr(m, "irreps_in", {}).get(getattr(m, "field", None))
+                if irreps is not None:
+                    feat_width = max(feat_width, irreps.dim)
+        if feat_width > 0:
+            metadata[_PAIR_NEQUIP_FEATURE_WIDTH_META_KEY] = str(feat_width)
+            logger.info(
+                f"pair_nequip multirank: per-layer ghost-exchange feature width is "
+                f"{feat_width} doubles/atom (stamped as "
+                f"'{_PAIR_NEQUIP_FEATURE_WIDTH_META_KEY}' for exact comm sizing)."
+            )
+        else:
+            logger.warning(
+                "pair_nequip multirank: could not determine the ghost-exchange feature "
+                "width (no PairNequIPGhostExchangeModule found?); the pair style will "
+                "fall back to its bounded default comm sizing."
+            )
 
     logger.debug(model)
 
