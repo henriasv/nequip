@@ -51,7 +51,10 @@ string — see feature C for why); `AtomwiseReduce` masks ghost contributions wi
 guard-free elementwise comparison so energies (and hence forces) are owned-only; the
 `enable_PairNequIPGhostExchange` model modifier swaps the no-op exchange module for the
 real one and is **auto-applied by the target** (it is not a user-facing choice; a
-self-correcting error rejects it with any other target).
+self-correcting error rejects it with any other target). `nequip-compile` additionally
+stamps the widest per-node feature width crossing the exchange
+(`pair_nequip_feature_width` metadata) so the pair style sizes its LAMMPS comm buffers
+exactly.
 
 ### B. Custom-op `.so` embedding for C++ consumers
 
@@ -143,10 +146,16 @@ Removed relative to the deployed LUMI line (not upstream): one env-gated debug d
   compute-bound; ~2.2–2.6× higher strong-scaling ceiling at small per-GCD load; details
   in the pair_nequip_allegro delta doc.
 
-Not yet done (needed for an upstream PR, tracked):
-- upstream-style documentation (a docs page for the multirank target/workflow) and a
-  CPU-runnable regression test of the export path (single-rank `nghost=0` gate);
-- the `slice_scatter` export reasoning and marker-key design deserve maintainer review
-  against upstream's export-guard conventions;
-- decide with maintainers whether the ZBL fix (audit row 4) should land as a separate,
-  self-contained PR first.
+Since resolved on this branch: a user-facing docs page
+(`docs/integrations/lammps/multirank.md`, linked from the LAMMPS docs index) and a
+CPU-runnable regression test (`PairNequIPMultirankMixin`,
+`test_pair_nequip_multirank_matches_single_rank`: single-rank vs multirank artifacts
+from the same model must agree at `nghost = 0`, plus the metadata-stamp asserts). The
+ZBL fix (audit row 4) is also available as the standalone branch
+`fix/zbl-local-ghost-scatter` for a separate PR.
+
+Still open for maintainer review:
+- the `slice_scatter` export reasoning and marker-key design vs upstream's export-guard
+  conventions;
+- whether the auto-rebundle machinery (feature C) belongs upstream or should remain a
+  deployment-side tool.
