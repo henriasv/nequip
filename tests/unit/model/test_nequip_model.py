@@ -2,6 +2,7 @@ import pytest
 from nequip.utils.unittests.model_tests_ase_integration import ASEIntegrationMixin
 from nequip.utils.unittests.model_tests_train_time_compile import TrainTimeCompileMixin
 from nequip.utils.unittests.model_tests_lammps import LAMMPSMLIAPIntegrationMixin
+from nequip.utils.unittests.model_tests_pair_nequip import PairNequIPMultirankMixin
 from nequip.utils.unittests.model_tests_torchsim import TorchSimIntegrationMixin
 from nequip.utils.versions import _TORCH_GE_2_7, _TORCH_IS_2_10_0
 
@@ -77,6 +78,7 @@ class TestNequIPModel(
     ASEIntegrationMixin,
     TorchSimIntegrationMixin,
     LAMMPSMLIAPIntegrationMixin,
+    PairNequIPMultirankMixin,
 ):
     """NequIP model tests.
 
